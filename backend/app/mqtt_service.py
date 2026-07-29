@@ -1,14 +1,16 @@
 import asyncio
 import logging
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import aiomqtt
 from pydantic import ValidationError
 
 from app.config import Settings
+from app.kitchen_pressure import KitchenPressureProjection
 from app.models import (
     FoodReady,
+    KitchenPressureSnapshot,
     OrderFailed,
     OrderProcessing,
     OrderQueued,
@@ -26,10 +28,12 @@ from app.order_state import (
     QueueAdmissionFailed,
 )
 from app.protocol import (
+    KITCHEN_PRESSURE_TOPIC,
     MQTT_QOS,
     ORDER_REQUESTED_TOPIC,
     ORDER_STATUS_CHANGED_TOPIC,
     decode_order_requested,
+    encode_kitchen_pressure,
     encode_order_status_changed,
     encode_table_snapshot,
     table_snapshot_topic,
@@ -73,7 +77,17 @@ class MqttOrderService:
             maxsize=(max_concurrent_orders + max_queued_orders) * 4,
         )
         self._pending_update: OrderStatusUpdate | None = None
-        self._table_projection = TableSnapshotProjection()
+        self._service_instance_id = uuid4()
+        self._table_projection = TableSnapshotProjection(
+            service_instance_id=self._service_instance_id,
+        )
+        self._pressure_projection = KitchenPressureProjection(
+            service_instance_id=self._service_instance_id,
+            worker_count=max_concurrent_orders,
+            queue_capacity=max_queued_orders,
+        )
+        self._pressure_changed = asyncio.Event()
+        self._pending_pressure_snapshot: KitchenPressureSnapshot | None = None
         self._snapshots_initialized = False
 
     def _client(self) -> aiomqtt.Client:
@@ -111,7 +125,7 @@ class MqttOrderService:
             try:
                 async with self._client() as client:
                     if not self._snapshots_initialized:
-                        await self._initialize_table_snapshots(client)
+                        await self._initialize_retained_snapshots(client)
                     await client.subscribe(ORDER_REQUESTED_TOPIC, qos=MQTT_QOS)
                     reconnect_delay = self._settings.reconnect_delay_seconds
                     LOGGER.info(
@@ -137,7 +151,7 @@ class MqttOrderService:
                 self._settings.reconnect_max_delay_seconds,
             )
 
-    async def _initialize_table_snapshots(self, client: aiomqtt.Client) -> None:
+    async def _initialize_retained_snapshots(self, client: aiomqtt.Client) -> None:
         snapshots = self._table_projection.initialize(self._clock())
         for snapshot in snapshots:
             topic = table_snapshot_topic(snapshot.table_id)
@@ -153,6 +167,21 @@ class MqttOrderService:
                 topic,
                 snapshot.revision,
             )
+        pressure = self._pressure_projection.initialize(self._clock())
+        await client.publish(
+            KITCHEN_PRESSURE_TOPIC,
+            payload=encode_kitchen_pressure(pressure),
+            qos=MQTT_QOS,
+            retain=True,
+        )
+        LOGGER.info(
+            "kitchen_pressure_initialized topic=%s revision=%d workers=%d "
+            "queue_capacity=%d",
+            KITCHEN_PRESSURE_TOPIC,
+            pressure.revision,
+            len(pressure.workers),
+            pressure.queue_capacity,
+        )
         self._snapshots_initialized = True
 
     async def _run_connected(self, client: aiomqtt.Client) -> None:
@@ -164,6 +193,10 @@ class MqttOrderService:
             asyncio.create_task(
                 self._publish_status_updates(client),
                 name="mqtt-status-publisher",
+            ),
+            asyncio.create_task(
+                self._publish_pressure_updates(client),
+                name="mqtt-pressure-publisher",
             ),
         }
 
@@ -262,6 +295,7 @@ class MqttOrderService:
             )
             return
 
+        self._pressure_changed.set()
         self._queue_status_update(
             OrderQueued(
                 schemaVersion=1,
@@ -289,6 +323,8 @@ class MqttOrderService:
                     ProcessingStarted(),
                 )
                 order = processing_order.order
+                self._pressure_projection.worker_started(worker_number, order)
+                self._pressure_changed.set()
                 self._queue_status_update(
                     OrderProcessing(
                         schemaVersion=1,
@@ -301,6 +337,8 @@ class MqttOrderService:
                 )
                 await self._process_order(processing_order, worker_number)
             finally:
+                self._pressure_projection.worker_stopped(worker_number)
+                self._pressure_changed.set()
                 self._processing_queue.task_done()
 
     async def _process_order(
@@ -419,3 +457,30 @@ class MqttOrderService:
             )
             self._status_updates.task_done()
             self._pending_update = None
+
+    async def _publish_pressure_updates(self, client: aiomqtt.Client) -> None:
+        while True:
+            if self._pending_pressure_snapshot is None:
+                await self._pressure_changed.wait()
+                self._pressure_changed.clear()
+                self._pending_pressure_snapshot = self._pressure_projection.capture(
+                    queued_orders=self._processing_queue.qsize(),
+                    generated_at=self._clock(),
+                )
+
+            snapshot = self._pending_pressure_snapshot
+            await client.publish(
+                KITCHEN_PRESSURE_TOPIC,
+                payload=encode_kitchen_pressure(snapshot),
+                qos=MQTT_QOS,
+                retain=True,
+            )
+            LOGGER.info(
+                "kitchen_pressure_published topic=%s revision=%d queued_orders=%d "
+                "busy_workers=%d",
+                KITCHEN_PRESSURE_TOPIC,
+                snapshot.revision,
+                snapshot.queued_orders,
+                sum(worker.status == "processing" for worker in snapshot.workers),
+            )
+            self._pending_pressure_snapshot = None

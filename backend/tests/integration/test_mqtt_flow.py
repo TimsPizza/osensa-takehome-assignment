@@ -10,11 +10,19 @@ from uuid import uuid4
 import aiomqtt
 import pytest
 
-from app.models import FoodReady, OrderFailed, OrderRequested, TableSnapshot
+from app.models import (
+    FoodReady,
+    KitchenPressureSnapshot,
+    OrderFailed,
+    OrderRequested,
+    TableSnapshot,
+)
 from app.protocol import (
+    KITCHEN_PRESSURE_TOPIC,
     MQTT_QOS,
     ORDER_REQUESTED_TOPIC,
     ORDER_STATUS_CHANGED_TOPIC,
+    decode_kitchen_pressure,
     decode_order_status_changed,
     decode_table_snapshot,
     table_snapshot_topic,
@@ -111,6 +119,24 @@ async def snapshot_client(table_id: int) -> AsyncIterator[aiomqtt.Client]:
         yield client
 
 
+@asynccontextmanager
+async def pressure_client() -> AsyncIterator[aiomqtt.Client]:
+    host = os.getenv("MQTT_TEST_HOST", "localhost")
+    port = int(os.getenv("MQTT_TEST_PORT", "9001"))
+    websocket_path = os.getenv("MQTT_TEST_WEBSOCKET_PATH", "/mqtt")
+
+    async with aiomqtt.Client(
+        hostname=host,
+        port=port,
+        identifier=f"pressure-test-{uuid4()}",
+        clean_session=True,
+        transport="websockets",
+        websocket_path=websocket_path,
+    ) as client:
+        await client.subscribe(KITCHEN_PRESSURE_TOPIC, qos=MQTT_QOS)
+        yield client
+
+
 async def publish_payload(client: aiomqtt.Client, payload: bytes) -> None:
     await client.publish(
         ORDER_REQUESTED_TOPIC,
@@ -183,6 +209,41 @@ async def wait_for_retained_snapshot(
     raise AssertionError(f"MQTT message stream ended before table {table_id} snapshot arrived")
 
 
+async def wait_for_pressure_cycle(
+    client: aiomqtt.Client,
+) -> tuple[KitchenPressureSnapshot, KitchenPressureSnapshot]:
+    peak: KitchenPressureSnapshot | None = None
+
+    async for message in client.messages:
+        if str(message.topic) != KITCHEN_PRESSURE_TOPIC:
+            continue
+        pressure = decode_kitchen_pressure(message.payload)
+        busy_workers = sum(
+            worker.status == "processing" for worker in pressure.workers
+        )
+        if busy_workers == len(pressure.workers) and pressure.queued_orders > 0:
+            peak = pressure
+        if peak is not None and busy_workers == 0 and pressure.queued_orders == 0:
+            return peak, pressure
+
+    raise AssertionError("MQTT message stream ended before pressure returned to idle")
+
+
+async def wait_for_full_pressure(
+    client: aiomqtt.Client,
+) -> KitchenPressureSnapshot:
+    async for message in client.messages:
+        if str(message.topic) != KITCHEN_PRESSURE_TOPIC:
+            continue
+        pressure = decode_kitchen_pressure(message.payload)
+        if pressure.queued_orders == pressure.queue_capacity and all(
+            worker.status == "processing" for worker in pressure.workers
+        ):
+            return pressure
+
+    raise AssertionError("MQTT message stream ended before the queue reached capacity")
+
+
 async def test_concurrent_orders_round_trip_over_websockets() -> None:
     expected = {
         str(uuid4()): ExpectedFood(table_id=1, food_name="Noodles"),
@@ -246,6 +307,34 @@ async def test_new_client_recovers_food_completed_while_ordering_client_was_clos
     assert recovered.ready_at == food.ready_at
     assert message.qos == MQTT_QOS
     assert message.retain is True
+
+
+async def test_pressure_snapshot_exposes_bounded_queue_and_worker_pool() -> None:
+    orders = [
+        order_payload(
+            order_id=str(uuid4()),
+            table_id=(index % 4) + 1,
+            food_name=f"Pressure order {index:02d}",
+        )
+        for index in range(20)
+    ]
+
+    async with asyncio.timeout(20):
+        async with pressure_client() as monitor:
+            async with connected_client(max_outgoing_calls=32) as producer:
+                await asyncio.gather(
+                    *(publish_payload(producer, payload) for payload in orders)
+                )
+                peak, idle = await wait_for_pressure_cycle(monitor)
+
+    assert peak.queue_capacity == 256
+    assert peak.queued_orders <= peak.queue_capacity
+    assert len(peak.workers) == 8
+    assert all(worker.status == "processing" for worker in peak.workers)
+    assert len({worker.worker_id for worker in peak.workers}) == 8
+    assert idle.revision > peak.revision
+    assert idle.queued_orders == 0
+    assert all(worker.status == "idle" for worker in idle.workers)
 
 
 async def test_malformed_and_invalid_orders_are_rejected_without_poisoning_flow() -> None:
@@ -425,37 +514,44 @@ async def test_saturated_burst_reports_explicit_admission_failures() -> None:
     order_ids = [str(uuid4()) for _ in range(worker_count + queue_capacity + rejected_count)]
 
     async with asyncio.timeout(30):
-        async with connected_client(max_outgoing_calls=320) as client:
-            await asyncio.gather(
-                *(
-                    publish_payload(
-                        client,
-                        order_payload(
-                            order_id=order_id,
-                            table_id=(index % 4) + 1,
-                            food_name=f"Saturation order {index:03d}",
-                        ),
+        async with pressure_client() as monitor:
+            full_pressure_task = asyncio.create_task(wait_for_full_pressure(monitor))
+            try:
+                async with connected_client(max_outgoing_calls=320) as client:
+                    await asyncio.gather(
+                        *(
+                            publish_payload(
+                                client,
+                                order_payload(
+                                    order_id=order_id,
+                                    table_id=(index % 4) + 1,
+                                    food_name=f"Saturation order {index:03d}",
+                                ),
+                            )
+                            for index, order_id in enumerate(order_ids)
+                        )
                     )
-                    for index, order_id in enumerate(order_ids)
-                )
-            )
 
-            admissions: dict[str, str] = {}
-            failures: dict[str, OrderFailed] = {}
-            async for message in client.messages:
-                if str(message.topic) != ORDER_STATUS_CHANGED_TOPIC:
-                    continue
-                update = decode_order_status_changed(message.payload)
-                update_order_id = str(update.order_id)
-                if update_order_id not in order_ids or update_order_id in admissions:
-                    continue
-                if update.status == "queued":
-                    admissions[update_order_id] = update.status
-                elif isinstance(update, OrderFailed):
-                    admissions[update_order_id] = update.status
-                    failures[update_order_id] = update
-                if len(admissions) == len(order_ids):
-                    break
+                    admissions: dict[str, str] = {}
+                    failures: dict[str, OrderFailed] = {}
+                    async for message in client.messages:
+                        if str(message.topic) != ORDER_STATUS_CHANGED_TOPIC:
+                            continue
+                        update = decode_order_status_changed(message.payload)
+                        update_order_id = str(update.order_id)
+                        if update_order_id not in order_ids or update_order_id in admissions:
+                            continue
+                        if update.status == "queued":
+                            admissions[update_order_id] = update.status
+                        elif isinstance(update, OrderFailed):
+                            admissions[update_order_id] = update.status
+                            failures[update_order_id] = update
+                        if len(admissions) == len(order_ids):
+                            break
+                full_pressure = await full_pressure_task
+            finally:
+                full_pressure_task.cancel()
+                await asyncio.gather(full_pressure_task, return_exceptions=True)
 
     assert Counter(admissions.values()) == {
         "queued": worker_count + queue_capacity,
@@ -465,3 +561,5 @@ async def test_saturated_burst_reports_explicit_admission_failures() -> None:
     assert all(
         failure.code == "service_overloaded" and failure.retryable for failure in failures.values()
     )
+    assert full_pressure.queued_orders == queue_capacity
+    assert len(full_pressure.workers) == worker_count

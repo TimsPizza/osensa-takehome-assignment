@@ -17,9 +17,11 @@ from app.order_state import (
     PublishConfirmed,
 )
 from app.protocol import (
+    KITCHEN_PRESSURE_TOPIC,
     MQTT_QOS,
     ORDER_REQUESTED_TOPIC,
     ORDER_STATUS_CHANGED_TOPIC,
+    decode_kitchen_pressure,
     decode_order_status_changed,
     decode_table_snapshot,
     table_snapshot_topic,
@@ -488,15 +490,15 @@ async def test_publisher_emits_ordered_status_union_and_confirms_ready_food() ->
     assert service._pending_update is None
 
 
-async def test_service_initializes_four_retained_empty_table_snapshots() -> None:
+async def test_service_initializes_retained_table_and_pressure_snapshots() -> None:
     service = MqttOrderService(make_settings())
-    client = RecordingClient(expected_messages=4)
+    client = RecordingClient(expected_messages=5)
 
-    await service._initialize_table_snapshots(client)  # type: ignore[arg-type]
+    await service._initialize_retained_snapshots(client)  # type: ignore[arg-type]
 
     snapshots = [
         decode_table_snapshot(payload)
-        for _topic, payload, _qos, _retain in client.published
+        for _topic, payload, _qos, _retain in client.published[:4]
     ]
     assert [snapshot.table_id for snapshot in snapshots] == [1, 2, 3, 4]
     assert all(snapshot.revision == 0 and snapshot.orders == () for snapshot in snapshots)
@@ -506,8 +508,48 @@ async def test_service_initializes_four_retained_empty_table_snapshots() -> None
         and retain is True
         for snapshot, (topic, _payload, qos, retain) in zip(
             snapshots,
-            client.published,
+            client.published[:4],
             strict=True,
         )
     )
+    pressure_topic, pressure_payload, pressure_qos, pressure_retain = client.published[4]
+    pressure = decode_kitchen_pressure(pressure_payload)
+    assert pressure_topic == KITCHEN_PRESSURE_TOPIC
+    assert pressure_qos == MQTT_QOS
+    assert pressure_retain is True
+    assert pressure.revision == 0
+    assert pressure.queued_orders == 0
+    assert pressure.queue_capacity == 256
+    assert len(pressure.workers) == 8
+    assert all(worker.status == "idle" for worker in pressure.workers)
     assert service._snapshots_initialized is True
+
+
+async def test_pressure_publisher_emits_a_retained_busy_worker_snapshot() -> None:
+    service = MqttOrderService(
+        make_settings(),
+        max_concurrent_orders=1,
+        max_queued_orders=2,
+    )
+    order = OrderRequested.model_validate_json(make_message(FIRST_ORDER_ID, 1).payload)
+    service._pressure_projection.initialize(READY_AT)
+    service._pressure_projection.worker_started(1, order)
+    service._pressure_changed.set()
+    client = RecordingClient(expected_messages=1)
+
+    publisher = asyncio.create_task(service._publish_pressure_updates(client))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(client.all_published.wait(), timeout=1)
+    finally:
+        publisher.cancel()
+        await asyncio.gather(publisher, return_exceptions=True)
+
+    topic, payload, qos, retain = client.published[0]
+    pressure = decode_kitchen_pressure(payload)
+    assert topic == KITCHEN_PRESSURE_TOPIC
+    assert qos == MQTT_QOS
+    assert retain is True
+    assert pressure.revision == 1
+    assert pressure.queued_orders == 0
+    assert pressure.workers[0].status == "processing"
+    assert service._pending_pressure_snapshot is None
