@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import type { OrderStatusChanged } from '$lib/generated/contracts';
+import type { KitchenPressureSnapshot, OrderStatusChanged } from '$lib/generated/contracts';
 import { RestaurantMqttClient } from '$lib/mqtt-client';
 import { createRandomOrders } from '$lib/random-orders';
 
@@ -39,6 +39,7 @@ describe.skipIf(!runIntegration)('frontend MQTT integration', () => {
 					}
 				},
 				onTableSnapshot: () => {},
+				onKitchenPressure: () => {},
 				onError: (message) => rejectFlow?.(new Error(message))
 			}
 		);
@@ -69,6 +70,51 @@ describe.skipIf(!runIntegration)('frontend MQTT integration', () => {
 			status: 'food_ready'
 		});
 	}, 15_000);
+
+	it('receives retained backend queue and worker capacity', async () => {
+		let resolveConnected: (() => void) | undefined;
+		let resolvePressure: (() => void) | undefined;
+		let pressure: KitchenPressureSnapshot | undefined;
+
+		const connected = new Promise<void>((resolve) => {
+			resolveConnected = resolve;
+		});
+		const pressureReceived = new Promise<void>((resolve) => {
+			resolvePressure = resolve;
+		});
+		const client = new RestaurantMqttClient(
+			import.meta.env.VITE_MQTT_URL ?? 'ws://localhost:9001/mqtt',
+			{
+				onConnectionChange: (state) => {
+					if (state === 'connected') resolveConnected?.();
+				},
+				onOrderStatus: () => {},
+				onTableSnapshot: () => {},
+				onKitchenPressure: (snapshot) => {
+					pressure = snapshot;
+					resolvePressure?.();
+				},
+				onError: () => {}
+			}
+		);
+
+		try {
+			client.connect();
+			await withTimeout(
+				Promise.all([connected, pressureReceived]),
+				5_000,
+				'retained kitchen pressure timed out'
+			);
+		} finally {
+			await client.disconnect();
+		}
+
+		expect(pressure).toMatchObject({
+			queueCapacity: 256,
+			queuedOrders: expect.any(Number)
+		});
+		expect(pressure?.workers).toHaveLength(8);
+	}, 10_000);
 
 	it('publishes ten random orders concurrently and receives every terminal state', async () => {
 		const batch = createRandomOrders(2);
@@ -109,6 +155,7 @@ describe.skipIf(!runIntegration)('frontend MQTT integration', () => {
 					}
 				},
 				onTableSnapshot: () => {},
+				onKitchenPressure: () => {},
 				onError: (message) => rejectFlow?.(new Error(message))
 			}
 		);
@@ -180,6 +227,7 @@ describe.skipIf(!runIntegration)('frontend MQTT integration', () => {
 				}
 			},
 			onTableSnapshot: () => {},
+			onKitchenPressure: () => {},
 			onError: (message) => rejectFlow?.(new Error(message))
 		});
 		const orderingClient = new RestaurantMqttClient(mqttUrl, {
@@ -188,6 +236,7 @@ describe.skipIf(!runIntegration)('frontend MQTT integration', () => {
 			},
 			onOrderStatus: () => {},
 			onTableSnapshot: () => {},
+			onKitchenPressure: () => {},
 			onError: (message) => rejectFlow?.(new Error(message))
 		});
 		const recoveryClient = new RestaurantMqttClient(mqttUrl, {
@@ -201,6 +250,7 @@ describe.skipIf(!runIntegration)('frontend MQTT integration', () => {
 				recoveredStatus = status;
 				resolveRecovered?.();
 			},
+			onKitchenPressure: () => {},
 			onError: (message) => rejectFlow?.(new Error(message))
 		});
 

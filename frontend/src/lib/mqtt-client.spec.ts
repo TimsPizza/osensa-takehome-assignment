@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+	decodeKitchenPressurePayload,
 	decodeOrderStatusPayload,
 	decodeTableSnapshotPayload,
 	resolveMqttUrl
@@ -110,5 +111,53 @@ describe('MQTT browser boundary', () => {
 		);
 
 		expect(decodeTableSnapshotPayload('restaurant/v1/table/2/snapshot', payload)).toBeUndefined();
+	});
+
+	it('decodes valid queue and worker pressure', () => {
+		const pressure = {
+			schemaVersion: 1,
+			serviceInstanceId: '1058bf2e-0ef0-4ae6-a3bc-267f1abbbd54',
+			revision: 7,
+			generatedAt: '2026-07-29T18:00:04Z',
+			queuedOrders: 3,
+			queueCapacity: 256,
+			workers: [
+				{ workerId: 1, status: 'idle' },
+				{
+					workerId: 2,
+					status: 'processing',
+					orderId: '3b11d31c-7d34-4dda-91e5-d64721a50463',
+					tableId: 2,
+					foodName: 'Chicken sandwich'
+				}
+			]
+		};
+
+		expect(decodeKitchenPressurePayload(encoder.encode(JSON.stringify(pressure)))).toEqual(
+			pressure
+		);
+	});
+
+	it.each([
+		{ queuedOrders: 257 },
+		{
+			workers: [
+				{ workerId: 1, status: 'idle' },
+				{ workerId: 1, status: 'idle' }
+			]
+		}
+	])('rejects inconsistent kitchen pressure: %o', (override) => {
+		const pressure = {
+			schemaVersion: 1,
+			serviceInstanceId: '1058bf2e-0ef0-4ae6-a3bc-267f1abbbd54',
+			revision: 7,
+			generatedAt: '2026-07-29T18:00:04Z',
+			queuedOrders: 3,
+			queueCapacity: 256,
+			workers: [{ workerId: 1, status: 'idle' }],
+			...override
+		};
+
+		expect(decodeKitchenPressurePayload(encoder.encode(JSON.stringify(pressure)))).toBeUndefined();
 	});
 });

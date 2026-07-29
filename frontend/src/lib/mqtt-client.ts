@@ -1,9 +1,11 @@
 import mqtt, { type MqttClient } from 'mqtt';
 
 import {
+	KitchenPressureSnapshotSchema,
 	OrderRequestedSchema,
 	OrderStatusChangedSchema,
 	TableSnapshotSchema,
+	type KitchenPressureSnapshot,
 	type OrderRequested,
 	type OrderStatusChanged,
 	type TableSnapshot
@@ -13,6 +15,7 @@ const ORDER_REQUESTED_TOPIC = 'restaurant/v1/order/requested';
 const ORDER_STATUS_CHANGED_TOPIC = 'restaurant/v1/order/status-changed';
 const TABLE_SNAPSHOT_TOPIC_FILTER = 'restaurant/v1/table/+/snapshot';
 const TABLE_SNAPSHOT_TOPIC = /^restaurant\/v1\/table\/([1-4])\/snapshot$/;
+const KITCHEN_PRESSURE_TOPIC = 'restaurant/v1/kitchen/pressure';
 const MQTT_QOS = 1 as const;
 
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'offline';
@@ -21,6 +24,7 @@ export interface MqttClientCallbacks {
 	onConnectionChange: (state: ConnectionState) => void;
 	onOrderStatus: (status: OrderStatusChanged) => void;
 	onTableSnapshot: (snapshot: TableSnapshot) => void;
+	onKitchenPressure: (snapshot: KitchenPressureSnapshot) => void;
 	onError: (message: string) => void;
 }
 
@@ -76,6 +80,26 @@ export function decodeTableSnapshotPayload(
 	}
 }
 
+export function decodeKitchenPressurePayload(
+	payload: Uint8Array
+): KitchenPressureSnapshot | undefined {
+	try {
+		const decoded: unknown = JSON.parse(new TextDecoder().decode(payload));
+		const result = KitchenPressureSnapshotSchema.safeParse(decoded);
+		if (!result.success || result.data.queuedOrders > result.data.queueCapacity) {
+			return undefined;
+		}
+
+		const workerIds = result.data.workers.map((worker) => worker.workerId);
+		if (new Set(workerIds).size !== workerIds.length) {
+			return undefined;
+		}
+		return result.data;
+	} catch {
+		return undefined;
+	}
+}
+
 export class RestaurantMqttClient {
 	readonly #url: string;
 	readonly #callbacks: MqttClientCallbacks;
@@ -109,13 +133,20 @@ export class RestaurantMqttClient {
 
 		client.on('connect', () => {
 			void client
-				.subscribeAsync([ORDER_STATUS_CHANGED_TOPIC, TABLE_SNAPSHOT_TOPIC_FILTER], {
-					qos: MQTT_QOS
-				})
+				.subscribeAsync(
+					[ORDER_STATUS_CHANGED_TOPIC, TABLE_SNAPSHOT_TOPIC_FILTER, KITCHEN_PRESSURE_TOPIC],
+					{
+						qos: MQTT_QOS
+					}
+				)
 				.then(() => {
 					this.#setState('connected');
 					console.info('mqtt_subscribed', {
-						topics: [ORDER_STATUS_CHANGED_TOPIC, TABLE_SNAPSHOT_TOPIC_FILTER],
+						topics: [
+							ORDER_STATUS_CHANGED_TOPIC,
+							TABLE_SNAPSHOT_TOPIC_FILTER,
+							KITCHEN_PRESSURE_TOPIC
+						],
 						qos: MQTT_QOS
 					});
 				})
@@ -133,6 +164,17 @@ export class RestaurantMqttClient {
 					return;
 				}
 				this.#callbacks.onOrderStatus(status);
+				return;
+			}
+
+			if (topic === KITCHEN_PRESSURE_TOPIC) {
+				const pressure = decodeKitchenPressurePayload(payload);
+				if (!pressure) {
+					console.warn('mqtt_pressure_rejected', { topic });
+					this.#callbacks.onError('An invalid kitchen pressure update was ignored.');
+					return;
+				}
+				this.#callbacks.onKitchenPressure(pressure);
 				return;
 			}
 

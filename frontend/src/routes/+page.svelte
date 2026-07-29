@@ -5,13 +5,14 @@
 	import { onMount } from 'svelte';
 	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
+	import KitchenPressure from '$lib/components/kitchen-pressure.svelte';
 	import TableCard from '$lib/components/table-card.svelte';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
 	import * as Dialog from '$lib/components/ui/dialog';
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
-	import { OrderRequestedSchema } from '$lib/generated/contracts';
+	import { OrderRequestedSchema, type KitchenPressureSnapshot } from '$lib/generated/contracts';
 	import { RestaurantMqttClient, resolveMqttUrl, type ConnectionState } from '$lib/mqtt-client';
 	import {
 		addSendingOrder,
@@ -28,6 +29,7 @@
 	const tables = [1, 2, 3, 4] as const;
 
 	let orders = $state<OrderView[]>([]);
+	let kitchenPressure = $state<KitchenPressureSnapshot>();
 	let connectionState = $state<ConnectionState>('connecting');
 	let connectionError = $state('');
 	let orderDialogOpen = $state(false);
@@ -75,6 +77,15 @@
 					serviceInstanceId: snapshot.serviceInstanceId,
 					revision: snapshot.revision
 				});
+			},
+			onKitchenPressure: (snapshot) => {
+				if (
+					!kitchenPressure ||
+					kitchenPressure.serviceInstanceId !== snapshot.serviceInstanceId ||
+					snapshot.revision > kitchenPressure.revision
+				) {
+					kitchenPressure = snapshot;
+				}
 			},
 			onError: (message) => {
 				connectionError = message;
@@ -216,6 +227,8 @@
 				</div>
 			</div>
 		{/if}
+
+		<KitchenPressure snapshot={kitchenPressure} {connected} />
 
 		<section class="grid gap-5 md:grid-cols-2 xl:grid-cols-4" aria-label="Restaurant tables">
 			{#each tables as tableId (tableId)}
