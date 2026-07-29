@@ -24,9 +24,7 @@ class TableSnapshotProjection:
         max_orders_per_table: int = MAX_SNAPSHOT_ORDERS,
     ) -> None:
         if max_orders_per_table < 1 or max_orders_per_table > MAX_SNAPSHOT_ORDERS:
-            raise ValueError(
-                f"max_orders_per_table must be between 1 and {MAX_SNAPSHOT_ORDERS}"
-            )
+            raise ValueError(f"max_orders_per_table must be between 1 and {MAX_SNAPSHOT_ORDERS}")
 
         self._service_instance_id = service_instance_id or uuid4()
         self._max_orders_per_table = max_orders_per_table
@@ -39,9 +37,7 @@ class TableSnapshotProjection:
 
     def initialize(self, generated_at: datetime) -> tuple[TableSnapshot, ...]:
         """Return authoritative empty snapshots before the service accepts orders."""
-        return tuple(
-            self._build_snapshot(table_id, generated_at) for table_id in TABLE_IDS
-        )
+        return tuple(self._build_snapshot(table_id, generated_at) for table_id in TABLE_IDS)
 
     def apply(
         self,

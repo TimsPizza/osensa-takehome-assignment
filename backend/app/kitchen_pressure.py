@@ -78,8 +78,7 @@ class KitchenPressureProjection:
         return (
             queued_orders,
             tuple(
-                order.order_id if order is not None else None
-                for order in self._workers.values()
+                order.order_id if order is not None else None for order in self._workers.values()
             ),
         )
 
