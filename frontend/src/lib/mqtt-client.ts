@@ -16,6 +16,11 @@ const ORDER_STATUS_CHANGED_TOPIC = 'restaurant/v1/order/status-changed';
 const TABLE_SNAPSHOT_TOPIC_FILTER = 'restaurant/v1/table/+/snapshot';
 const TABLE_SNAPSHOT_TOPIC = /^restaurant\/v1\/table\/([1-4])\/snapshot$/;
 const KITCHEN_PRESSURE_TOPIC = 'restaurant/v1/kitchen/pressure';
+const SUBSCRIPTION_TOPICS = [
+	ORDER_STATUS_CHANGED_TOPIC,
+	TABLE_SNAPSHOT_TOPIC_FILTER,
+	KITCHEN_PRESSURE_TOPIC
+];
 const MQTT_QOS = 1 as const;
 
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'offline';
@@ -133,20 +138,13 @@ export class RestaurantMqttClient {
 
 		client.on('connect', () => {
 			void client
-				.subscribeAsync(
-					[ORDER_STATUS_CHANGED_TOPIC, TABLE_SNAPSHOT_TOPIC_FILTER, KITCHEN_PRESSURE_TOPIC],
-					{
-						qos: MQTT_QOS
-					}
-				)
+				.subscribeAsync(SUBSCRIPTION_TOPICS, {
+					qos: MQTT_QOS
+				})
 				.then(() => {
 					this.#setState('connected');
 					console.info('mqtt_subscribed', {
-						topics: [
-							ORDER_STATUS_CHANGED_TOPIC,
-							TABLE_SNAPSHOT_TOPIC_FILTER,
-							KITCHEN_PRESSURE_TOPIC
-						],
+						topics: SUBSCRIPTION_TOPICS,
 						qos: MQTT_QOS
 					});
 				})
@@ -229,6 +227,15 @@ export class RestaurantMqttClient {
 
 		this.#disconnecting = true;
 		this.#client = undefined;
+		if (client.connected) {
+			try {
+				await client.unsubscribeAsync(SUBSCRIPTION_TOPICS);
+			} catch (error) {
+				console.warn('mqtt_unsubscribe_failed', {
+					message: error instanceof Error ? error.message : 'Unknown unsubscribe error'
+				});
+			}
+		}
 		await client.endAsync();
 		this.#setState('offline');
 	}
