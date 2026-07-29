@@ -1,0 +1,49 @@
+name: osensa-restaurant
+
+services:
+  broker:
+    image: eclipse-mosquitto:2.1.2-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - ./deploy/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mosquitto_sub",
+          "--ws",
+          "-h",
+          "localhost",
+          "-p",
+          "9001",
+          "-t",
+          "$$SYS/broker/version",
+          "-C",
+          "1",
+          "-W",
+          "3",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 2s
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      MQTT_HOST: broker
+      MQTT_PORT: "9001"
+      MQTT_WEBSOCKET_PATH: /mqtt
+      MQTT_CLIENT_ID: osensa-order-service
+      LOG_LEVEL: INFO
+    depends_on:
+      broker:
+        condition: service_healthy
