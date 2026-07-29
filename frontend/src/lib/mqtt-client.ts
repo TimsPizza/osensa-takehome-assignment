@@ -22,6 +22,7 @@ const SUBSCRIPTION_TOPICS = [
 	KITCHEN_PRESSURE_TOPIC
 ];
 const MQTT_QOS = 1 as const;
+export const MQTT_URL_STORAGE_KEY = 'osensa.mqtt.websocket-url';
 
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'offline';
 
@@ -38,6 +39,12 @@ interface BrowserLocation {
 	hostname: string;
 }
 
+interface BrowserStorage {
+	getItem(key: string): string | null;
+	setItem(key: string, value: string): void;
+	removeItem(key: string): void;
+}
+
 export function resolveMqttUrl(location: BrowserLocation, configuredUrl?: string): string {
 	const explicitUrl = configuredUrl?.trim();
 	if (explicitUrl) {
@@ -48,6 +55,61 @@ export function resolveMqttUrl(location: BrowserLocation, configuredUrl?: string
 	const localPort =
 		location.hostname === 'localhost' || location.hostname === '127.0.0.1' ? ':9001' : '';
 	return `${websocketProtocol}//${location.hostname}${localPort}/mqtt`;
+}
+
+export function normalizeMqttUrl(value: string, pageProtocol?: string): string {
+	const candidate = value.trim();
+	if (!candidate) {
+		throw new Error('Enter a Broker WebSocket URL.');
+	}
+
+	let url: URL;
+	try {
+		url = new URL(candidate);
+	} catch {
+		throw new Error('Enter a complete URL, for example wss://broker.example.com/mqtt.');
+	}
+
+	if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
+		throw new Error('The Broker URL must use ws:// or wss://.');
+	}
+	if (!url.hostname) {
+		throw new Error('The Broker URL must include a hostname.');
+	}
+	if (pageProtocol === 'https:' && url.protocol !== 'wss:') {
+		throw new Error('An HTTPS page requires a secure wss:// Broker URL.');
+	}
+	if (url.hash) {
+		throw new Error('Remove the #fragment from the Broker URL.');
+	}
+
+	return url.href;
+}
+
+export function readStoredMqttUrl(
+	storage: BrowserStorage,
+	pageProtocol?: string
+): string | undefined {
+	try {
+		const storedUrl = storage.getItem(MQTT_URL_STORAGE_KEY);
+		return storedUrl ? normalizeMqttUrl(storedUrl, pageProtocol) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export function storeMqttUrl(
+	storage: BrowserStorage,
+	value: string,
+	pageProtocol?: string
+): string {
+	const normalizedUrl = normalizeMqttUrl(value, pageProtocol);
+	storage.setItem(MQTT_URL_STORAGE_KEY, normalizedUrl);
+	return normalizedUrl;
+}
+
+export function clearStoredMqttUrl(storage: BrowserStorage): void {
+	storage.removeItem(MQTT_URL_STORAGE_KEY);
 }
 
 export function decodeOrderStatusPayload(payload: Uint8Array): OrderStatusChanged | undefined {

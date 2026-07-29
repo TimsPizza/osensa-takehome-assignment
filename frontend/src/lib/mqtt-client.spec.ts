@@ -1,10 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+	clearStoredMqttUrl,
 	decodeKitchenPressurePayload,
 	decodeOrderStatusPayload,
 	decodeTableSnapshotPayload,
-	resolveMqttUrl
+	MQTT_URL_STORAGE_KEY,
+	normalizeMqttUrl,
+	readStoredMqttUrl,
+	resolveMqttUrl,
+	storeMqttUrl
 } from '$lib/mqtt-client';
 
 const encoder = new TextEncoder();
@@ -25,6 +30,56 @@ describe('MQTT browser boundary', () => {
 		]
 	])('resolves a deployable broker URL', (location, configured, expected) => {
 		expect(resolveMqttUrl(location, configured)).toBe(expected);
+	});
+
+	it.each([
+		[' wss://broker.example.com/mqtt ', 'https:', 'wss://broker.example.com/mqtt'],
+		['ws://10.0.0.4:9001/mqtt', 'http:', 'ws://10.0.0.4:9001/mqtt']
+	])('normalizes a valid Broker URL', (value, pageProtocol, expected) => {
+		expect(normalizeMqttUrl(value, pageProtocol)).toBe(expected);
+	});
+
+	it.each([
+		['', 'http:', 'Enter a Broker WebSocket URL.'],
+		['broker.example.com/mqtt', 'https:', 'Enter a complete URL'],
+		['https://broker.example.com/mqtt', 'https:', 'must use ws:// or wss://'],
+		['ws://broker.example.com/mqtt', 'https:', 'requires a secure wss://'],
+		['wss://broker.example.com/mqtt#ignored', 'https:', 'Remove the #fragment']
+	])('rejects an unusable Broker URL', (value, pageProtocol, expectedMessage) => {
+		expect(() => normalizeMqttUrl(value, pageProtocol)).toThrow(expectedMessage);
+	});
+
+	it('reads a valid persisted Broker override and ignores a stale invalid value', () => {
+		const validStorage = {
+			getItem: (key: string) =>
+				key === MQTT_URL_STORAGE_KEY ? 'wss://broker.example.com/mqtt' : null,
+			setItem: () => undefined,
+			removeItem: () => undefined
+		};
+		const invalidStorage = {
+			...validStorage,
+			getItem: () => 'http://broker.example.com/mqtt'
+		};
+
+		expect(readStoredMqttUrl(validStorage, 'https:')).toBe('wss://broker.example.com/mqtt');
+		expect(readStoredMqttUrl(invalidStorage, 'https:')).toBeUndefined();
+	});
+
+	it('persists and clears a normalized Broker override', () => {
+		const values = new Map<string, string>();
+		const storage = {
+			getItem: (key: string) => values.get(key) ?? null,
+			setItem: (key: string, value: string) => values.set(key, value),
+			removeItem: (key: string) => values.delete(key)
+		};
+
+		expect(storeMqttUrl(storage, ' wss://broker.example.com/mqtt ', 'https:')).toBe(
+			'wss://broker.example.com/mqtt'
+		);
+		expect(readStoredMqttUrl(storage, 'https:')).toBe('wss://broker.example.com/mqtt');
+
+		clearStoredMqttUrl(storage);
+		expect(readStoredMqttUrl(storage, 'https:')).toBeUndefined();
 	});
 
 	it('decodes and validates a status update', () => {
