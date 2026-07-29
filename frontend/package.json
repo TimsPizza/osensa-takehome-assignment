@@ -4,6 +4,8 @@
 	"version": "0.0.1",
 	"type": "module",
 	"scripts": {
+		"contract:gen": "node scripts/generate-contracts.mjs",
+		"contract:check": "node scripts/generate-contracts.mjs --check",
 		"dev": "vite dev",
 		"build": "vite build",
 		"preview": "vite preview",
@@ -13,7 +15,7 @@
 		"lint": "prettier --check . && eslint .",
 		"format": "prettier --write .",
 		"test:unit": "vitest",
-		"test": "npm run test:unit -- --run"
+		"test": "vitest --run"
 	},
 	"devDependencies": {
 		"@eslint/js": "^10.0.1",
@@ -27,6 +29,7 @@
 		"eslint-config-prettier": "^10.1.8",
 		"eslint-plugin-svelte": "^3.19.0",
 		"globals": "^17.6.0",
+		"json-schema-to-zod": "2.8.1",
 		"playwright": "^1.60.0",
 		"prettier": "^3.8.3",
 		"prettier-plugin-svelte": "^4.1.0",
