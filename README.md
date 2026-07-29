@@ -125,10 +125,12 @@ from whichever task happens to deliver an MQTT message.
 ### Prerequisites
 
 - Docker with the Compose plugin
-- Node.js with Corepack
-- Python 3.12 and [`uv`](https://docs.astral.sh/uv/) for tests and contract generation
 
-### Start the Broker and backend
+Node.js with Corepack and Python 3.12 with
+[`uv`](https://docs.astral.sh/uv/) are needed only for local development,
+contract generation, and tests.
+
+### Start the complete application
 
 From the repository root:
 
@@ -136,14 +138,31 @@ From the repository root:
 docker compose up --build --wait
 ```
 
+Open `http://localhost:5173`.
+
+Compose builds the Svelte app into a static, read-only Caddy container and
+starts it together with Mosquitto and the backend.
+
+If port 5173 is already in use, choose another loopback port:
+
+```sh
+FRONTEND_PORT=15173 docker compose up --build --wait
+```
+
 The default Compose stack exposes Mosquitto only on
 `ws://127.0.0.1:9001/mqtt`. This development listener intentionally allows
 anonymous access and is bound to loopback. It must not be exposed to the
 internet.
 
-### Start the frontend
+### Frontend development with hot reload
 
-In another terminal:
+Start only the Broker and backend:
+
+```sh
+docker compose up --build --wait broker backend
+```
+
+Then run Vite in another terminal:
 
 ```sh
 cd frontend
@@ -151,7 +170,7 @@ corepack pnpm install
 corepack pnpm dev
 ```
 
-Open `http://localhost:5173`. The frontend connects to
+The frontend connects to
 `ws://localhost:9001/mqtt` automatically.
 
 Use the Broker settings dialog to override the endpoint. HTTPS pages require a
@@ -410,6 +429,8 @@ backend/
   tests/unit/             deterministic domain and service tests
   tests/integration/      real MQTT flow, load, recovery, and ACL tests
 frontend/
+  Dockerfile              multi-stage static UI image
+  Caddyfile               loopback UI static server
   scripts/                Pydantic JSON Schema to Zod generator
   src/lib/generated/      committed generated MQTT contracts
   src/lib/                MQTT client, reducers, Boundary Lab, UI components

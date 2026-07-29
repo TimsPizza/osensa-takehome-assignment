@@ -3,7 +3,16 @@
 Svelte 5 client for the restaurant ordering flow. It communicates directly with
 Mosquitto over WebSockets; there is no REST API.
 
-Run the broker and backend from the repository root, then start the UI:
+For a zero-configuration build, run the complete stack from the repository root:
+
+```sh
+docker compose up --build --wait
+```
+
+Open `http://localhost:5173`.
+
+For frontend development with hot reload, run the broker and backend from the
+repository root, then start Vite:
 
 ```sh
 corepack pnpm install
