@@ -1,4 +1,3 @@
-# svelte-fastapi-template
 # OSENSA Take-home Assignment
 
 Restaurant orders travel through MQTT over WebSockets:
@@ -11,7 +10,7 @@ test client <── FOOD ─── Mosquitto <── Python service
 The current milestone is a deliberately small, executable vertical slice. Pydantic
 models own the public wire contract, the frontend receives generated Zod schemas
 and TypeScript types, and Docker Compose proves the broker-to-backend path. The
-backend processes up to four orders concurrently with a random one-to-five-second
+backend processes up to eight orders concurrently with a random one-to-five-second
 delay. The UI is not implemented yet.
 
 ## Prerequisites
@@ -35,6 +34,15 @@ Run the real MQTT round-trip test while the stack is running:
 ```sh
 cd backend
 RUN_MQTT_INTEGRATION=1 uv run pytest tests/integration/test_mqtt_flow.py
+```
+
+The normal integration suite includes malformed payload, idempotency, conflict,
+and lifecycle checks. Burst and saturation tests are opt-in because they take
+longer and intentionally fill the processing queue:
+
+```sh
+RUN_MQTT_INTEGRATION=1 RUN_MQTT_LOAD=1 \
+  uv run pytest tests/integration/test_mqtt_flow.py -m load
 ```
 
 Stop the stack:
