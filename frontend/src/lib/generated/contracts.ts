@@ -12,13 +12,50 @@ export const OrderRequestedSchema = z
 	.strict();
 export type OrderRequested = z.infer<typeof OrderRequestedSchema>;
 
-export const FoodReadySchema = z
-	.object({
-		schemaVersion: z.literal(1),
-		orderId: z.string().uuid(),
-		tableId: z.number().int().gte(1).lte(4),
-		foodName: z.string().regex(new RegExp('^\\S(?:.*\\S)?$')).min(1).max(100),
-		readyAt: z.string().datetime({ offset: true })
-	})
-	.strict();
-export type FoodReady = z.infer<typeof FoodReadySchema>;
+export const OrderStatusChangedSchema = z.discriminatedUnion('status', [
+	z
+		.object({
+			schemaVersion: z.literal(1),
+			orderId: z.string().uuid(),
+			tableId: z.number().int().gte(1).lte(4),
+			foodName: z.string().regex(new RegExp('^\\S(?:.*\\S)?$')).min(1).max(100),
+			occurredAt: z.string().datetime({ offset: true }),
+			status: z.literal('queued')
+		})
+		.strict(),
+	z
+		.object({
+			schemaVersion: z.literal(1),
+			orderId: z.string().uuid(),
+			tableId: z.number().int().gte(1).lte(4),
+			foodName: z.string().regex(new RegExp('^\\S(?:.*\\S)?$')).min(1).max(100),
+			occurredAt: z.string().datetime({ offset: true }),
+			status: z.literal('processing')
+		})
+		.strict(),
+	z
+		.object({
+			schemaVersion: z.literal(1),
+			orderId: z.string().uuid(),
+			tableId: z.number().int().gte(1).lte(4),
+			foodName: z.string().regex(new RegExp('^\\S(?:.*\\S)?$')).min(1).max(100),
+			occurredAt: z.string().datetime({ offset: true }),
+			status: z.literal('food_ready'),
+			readyAt: z.string().datetime({ offset: true })
+		})
+		.strict(),
+	z
+		.object({
+			schemaVersion: z.literal(1),
+			orderId: z.string().uuid(),
+			tableId: z.number().int().gte(1).lte(4),
+			foodName: z.string().regex(new RegExp('^\\S(?:.*\\S)?$')).min(1).max(100),
+			occurredAt: z.string().datetime({ offset: true }),
+			status: z.literal('failed'),
+			code: z.enum(['processing_failed', 'service_overloaded']),
+			message: z.string().min(1).max(200),
+			retryable: z.boolean()
+		})
+		.strict()
+]);
+export type OrderStatusChanged = z.infer<typeof OrderStatusChangedSchema>;

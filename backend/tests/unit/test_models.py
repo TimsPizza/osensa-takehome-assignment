@@ -5,7 +5,14 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import ValidationError
 
-from app.models import FoodReady, OrderRequested
+from app.models import (
+    FoodReady,
+    OrderFailed,
+    OrderProcessing,
+    OrderQueued,
+    OrderRequested,
+    OrderStatusChanged,
+)
 
 
 def order_payload(**overrides: object) -> dict[str, object]:
@@ -72,6 +79,8 @@ def test_food_ready_serializes_the_frontend_wire_shape() -> None:
         orderId=order_id,
         tableId=4,
         foodName="Soup",
+        status="food_ready",
+        occurredAt=datetime(2026, 7, 28, 20, 15, 31, tzinfo=UTC),
         readyAt=datetime(2026, 7, 28, 20, 15, 31, tzinfo=UTC),
     )
 
@@ -82,6 +91,8 @@ def test_food_ready_serializes_the_frontend_wire_shape() -> None:
         "orderId": str(order_id),
         "tableId": 4,
         "foodName": "Soup",
+        "status": "food_ready",
+        "occurredAt": "2026-07-28T20:15:31Z",
         "readyAt": "2026-07-28T20:15:31Z",
     }
 
@@ -93,6 +104,8 @@ def test_food_ready_requires_a_timezone() -> None:
             orderId=uuid4(),
             tableId=1,
             foodName="Soup",
+            status="food_ready",
+            occurredAt=datetime(2026, 7, 28, 20, 15, 31, tzinfo=UTC),
             readyAt=datetime(2026, 7, 28, 20, 15, 31),
         )
 
@@ -105,3 +118,103 @@ def test_json_schema_uses_aliases_and_forbids_extra_fields() -> None:
     assert "order_id" not in schema["properties"]
     assert schema["properties"]["tableId"]["minimum"] == 1
     assert schema["properties"]["tableId"]["maximum"] == 4
+
+
+@pytest.mark.parametrize(
+    ("payload", "variant"),
+    [
+        (
+            {
+                "schemaVersion": 1,
+                "orderId": str(uuid4()),
+                "tableId": 1,
+                "foodName": "Soup",
+                "status": "queued",
+                "occurredAt": "2026-07-28T20:15:31Z",
+            },
+            OrderQueued,
+        ),
+        (
+            {
+                "schemaVersion": 1,
+                "orderId": str(uuid4()),
+                "tableId": 2,
+                "foodName": "Pizza",
+                "status": "processing",
+                "occurredAt": "2026-07-28T20:15:31Z",
+            },
+            OrderProcessing,
+        ),
+        (
+            {
+                "schemaVersion": 1,
+                "orderId": str(uuid4()),
+                "tableId": 3,
+                "foodName": "Noodles",
+                "status": "food_ready",
+                "occurredAt": "2026-07-28T20:15:31Z",
+                "readyAt": "2026-07-28T20:15:31Z",
+            },
+            FoodReady,
+        ),
+        (
+            {
+                "schemaVersion": 1,
+                "orderId": str(uuid4()),
+                "tableId": 4,
+                "foodName": "Tacos",
+                "status": "failed",
+                "occurredAt": "2026-07-28T20:15:31Z",
+                "code": "processing_failed",
+                "message": "The order could not be prepared.",
+                "retryable": True,
+            },
+            OrderFailed,
+        ),
+    ],
+)
+def test_order_status_changed_discriminates_public_variants(
+    payload: dict[str, object],
+    variant: type[object],
+) -> None:
+    update = OrderStatusChanged.model_validate_json(json.dumps(payload)).root
+
+    assert isinstance(update, variant)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"status": "unknown"},
+        {"status": "failed"},
+        {
+            "status": "failed",
+            "code": "internal_exception_name",
+            "message": "unsafe",
+            "retryable": True,
+        },
+    ],
+)
+def test_order_status_changed_rejects_invalid_variants(
+    override: dict[str, object],
+) -> None:
+    payload = {
+        "schemaVersion": 1,
+        "orderId": str(uuid4()),
+        "tableId": 1,
+        "foodName": "Soup",
+        "occurredAt": "2026-07-28T20:15:31Z",
+        **override,
+    }
+
+    with pytest.raises(ValidationError):
+        OrderStatusChanged.model_validate_json(json.dumps(payload))
+
+
+def test_order_status_schema_exposes_a_discriminated_union() -> None:
+    schema = OrderStatusChanged.model_json_schema(by_alias=True, mode="serialization")
+    root_reference = schema["$ref"].removeprefix("#/$defs/")
+    union_schema = schema["$defs"][root_reference]
+
+    assert union_schema["discriminator"]["propertyName"] == "status"
+    assert len(union_schema["oneOf"]) == 4

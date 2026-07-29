@@ -7,8 +7,15 @@ import aiomqtt
 from pydantic import ValidationError
 
 from app.config import Settings
-from app.models import FoodReady, OrderRequested
-from app.order_processor import OrderProcessor
+from app.models import (
+    FoodReady,
+    OrderFailed,
+    OrderProcessing,
+    OrderQueued,
+    OrderRequested,
+    OrderStatusUpdate,
+)
+from app.order_processor import Clock, OrderProcessor, utc_now
 from app.order_registry import OrderRegistry, RegistrationAction
 from app.order_state import (
     FoodPrepared,
@@ -19,14 +26,16 @@ from app.order_state import (
     QueueAdmissionFailed,
 )
 from app.protocol import (
-    FOOD_READY_TOPIC,
     MQTT_QOS,
     ORDER_REQUESTED_TOPIC,
+    ORDER_STATUS_CHANGED_TOPIC,
     decode_order_requested,
-    encode_food_ready,
+    encode_order_status_changed,
 )
 
 LOGGER = logging.getLogger(__name__)
+PROCESSING_FAILED_MESSAGE = "The order could not be prepared. Please retry."
+SERVICE_OVERLOADED_MESSAGE = "The order service is at capacity. Please retry."
 
 
 class Processor(Protocol):
@@ -42,6 +51,7 @@ class MqttOrderService:
         *,
         max_concurrent_orders: int = 8,
         max_queued_orders: int = 256,
+        clock: Clock = utc_now,
     ) -> None:
         if max_concurrent_orders < 1:
             raise ValueError("max_concurrent_orders must be greater than zero")
@@ -51,14 +61,15 @@ class MqttOrderService:
         self._settings = settings
         self._processor = processor if processor is not None else OrderProcessor()
         self._registry = registry if registry is not None else OrderRegistry()
+        self._clock = clock
         self._worker_count = max_concurrent_orders
         self._processing_queue: asyncio.Queue[UUID] = asyncio.Queue(
             maxsize=max_queued_orders,
         )
-        self._ready_orders: asyncio.Queue[OrderState] = asyncio.Queue(
-            maxsize=max_concurrent_orders + max_queued_orders,
+        self._status_updates: asyncio.Queue[OrderStatusUpdate] = asyncio.Queue(
+            maxsize=(max_concurrent_orders + max_queued_orders) * 4,
         )
-        self._pending_order: OrderState | None = None
+        self._pending_update: OrderStatusUpdate | None = None
 
     def _client(self) -> aiomqtt.Client:
         return aiomqtt.Client(
@@ -124,8 +135,8 @@ class MqttOrderService:
                 name="mqtt-order-receiver",
             ),
             asyncio.create_task(
-                self._publish_ready_food(client),
-                name="mqtt-food-publisher",
+                self._publish_status_updates(client),
+                name="mqtt-status-publisher",
             ),
         }
 
@@ -185,7 +196,10 @@ class MqttOrderService:
             return
 
         if registration.action is RegistrationAction.REPUBLISH:
-            await self._ready_orders.put(registration.state)
+            food = registration.state.food
+            if food is None:
+                raise RuntimeError(f"republished order has no food: {order.order_id}")
+            self._queue_status_update(food)
             LOGGER.info(
                 "order_republish_scheduled order_id=%s status=%s",
                 order.order_id,
@@ -200,6 +214,19 @@ class MqttOrderService:
                 order.order_id,
                 QueueAdmissionFailed("processing queue is full"),
             )
+            self._queue_status_update(
+                OrderFailed(
+                    schemaVersion=1,
+                    orderId=order.order_id,
+                    tableId=order.table_id,
+                    foodName=order.food_name,
+                    status="failed",
+                    occurredAt=self._clock(),
+                    code="service_overloaded",
+                    message=SERVICE_OVERLOADED_MESSAGE,
+                    retryable=True,
+                )
+            )
             LOGGER.warning(
                 "order_queue_admission_failed order_id=%s table_id=%d status=%s",
                 order.order_id,
@@ -208,6 +235,16 @@ class MqttOrderService:
             )
             return
 
+        self._queue_status_update(
+            OrderQueued(
+                schemaVersion=1,
+                orderId=order.order_id,
+                tableId=order.table_id,
+                foodName=order.food_name,
+                status="queued",
+                occurredAt=self._clock(),
+            )
+        )
         LOGGER.info(
             "order_queued order_id=%s table_id=%d status=%s queue_size=%d",
             order.order_id,
@@ -223,6 +260,17 @@ class MqttOrderService:
                 processing_order = self._registry.apply(
                     order_id,
                     ProcessingStarted(),
+                )
+                order = processing_order.order
+                self._queue_status_update(
+                    OrderProcessing(
+                        schemaVersion=1,
+                        orderId=order.order_id,
+                        tableId=order.table_id,
+                        foodName=order.food_name,
+                        status="processing",
+                        occurredAt=self._clock(),
+                    )
                 )
                 await self._process_order(processing_order, worker_number)
             finally:
@@ -252,6 +300,19 @@ class MqttOrderService:
                 order.order_id,
                 ProcessingFailed(failure_reason),
             )
+            self._queue_status_update(
+                OrderFailed(
+                    schemaVersion=1,
+                    orderId=order.order_id,
+                    tableId=order.table_id,
+                    foodName=order.food_name,
+                    status="failed",
+                    occurredAt=self._clock(),
+                    code="processing_failed",
+                    message=PROCESSING_FAILED_MESSAGE,
+                    retryable=True,
+                )
+            )
             LOGGER.exception(
                 "order_processing_failed order_id=%s table_id=%d status=%s reason=%s",
                 order.order_id,
@@ -265,7 +326,7 @@ class MqttOrderService:
             order.order_id,
             FoodPrepared(food),
         )
-        await self._ready_orders.put(ready_order)
+        self._queue_status_update(food)
         LOGGER.info(
             "order_processing_finished order_id=%s table_id=%d status=%s worker=%d",
             food.order_id,
@@ -274,33 +335,46 @@ class MqttOrderService:
             worker_number,
         )
 
-    async def _publish_ready_food(self, client: aiomqtt.Client) -> None:
+    def _queue_status_update(self, update: OrderStatusUpdate) -> None:
+        try:
+            self._status_updates.put_nowait(update)
+        except asyncio.QueueFull as error:
+            LOGGER.critical(
+                "order_status_queue_full order_id=%s status=%s",
+                update.order_id,
+                update.status,
+            )
+            raise RuntimeError("order status update queue is full") from error
+
+    async def _publish_status_updates(self, client: aiomqtt.Client) -> None:
         while True:
-            if self._pending_order is None:
-                self._pending_order = await self._ready_orders.get()
+            if self._pending_update is None:
+                self._pending_update = await self._status_updates.get()
 
-            ready_order = self._pending_order
-            food = ready_order.food
-            if food is None:
-                raise RuntimeError(
-                    f"{ready_order.status} order {ready_order.order.order_id} has no food"
-                )
-
+            update = self._pending_update
             await client.publish(
-                FOOD_READY_TOPIC,
-                payload=encode_food_ready(food),
+                ORDER_STATUS_CHANGED_TOPIC,
+                payload=encode_order_status_changed(update),
                 qos=MQTT_QOS,
                 retain=False,
             )
-            published_order = self._registry.apply(
-                ready_order.order.order_id,
-                PublishConfirmed(),
-            )
+
+            internal_status = update.status
+            if isinstance(update, FoodReady):
+                published_order = self._registry.apply(
+                    update.order_id,
+                    PublishConfirmed(),
+                )
+                internal_status = published_order.status
+
             LOGGER.info(
-                "food_published order_id=%s table_id=%d topic=%s status=%s",
-                food.order_id,
-                food.table_id,
-                FOOD_READY_TOPIC,
-                published_order.status,
+                "order_status_published order_id=%s table_id=%d topic=%s "
+                "public_status=%s internal_status=%s",
+                update.order_id,
+                update.table_id,
+                ORDER_STATUS_CHANGED_TOPIC,
+                update.status,
+                internal_status,
             )
-            self._pending_order = None
+            self._status_updates.task_done()
+            self._pending_update = None

@@ -47,6 +47,7 @@ async def test_process_waits_for_sampled_delay_and_preserves_order_fields() -> N
     assert food.order_id == ORDER_ID
     assert food.table_id == 2
     assert food.food_name == "Chicken sandwich"
+    assert food.occurred_at == READY_AT
     assert food.ready_at == READY_AT
 
 
@@ -69,6 +70,7 @@ async def test_ready_timestamp_is_captured_after_processing_finishes() -> None:
 
     food = await processor.process(make_order())
 
+    assert food.occurred_at == READY_AT
     assert food.ready_at == READY_AT
 
 

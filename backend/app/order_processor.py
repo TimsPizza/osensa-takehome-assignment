@@ -37,11 +37,14 @@ class OrderProcessor:
             self.max_delay_seconds,
         )
         await self.sleeper(delay_seconds)
+        ready_at = self.clock()
 
         return FoodReady(
             schemaVersion=1,
             orderId=order.order_id,
             tableId=order.table_id,
             foodName=order.food_name,
-            readyAt=self.clock(),
+            status="food_ready",
+            occurredAt=ready_at,
+            readyAt=ready_at,
         )

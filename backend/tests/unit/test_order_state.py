@@ -47,6 +47,8 @@ def make_food(
         orderId=order_id,
         tableId=table_id,
         foodName=food_name,
+        status="food_ready",
+        occurredAt=READY_AT,
         readyAt=READY_AT,
     )
 

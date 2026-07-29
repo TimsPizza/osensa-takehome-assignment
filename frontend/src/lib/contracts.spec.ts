@@ -1,12 +1,17 @@
 import { describe, expect, it } from 'vitest';
 
-import { FoodReadySchema, OrderRequestedSchema } from './generated/contracts';
+import { OrderRequestedSchema, OrderStatusChangedSchema } from './generated/contracts';
 
 const validOrder = {
 	schemaVersion: 1,
 	orderId: '3b11d31c-7d34-4dda-91e5-d64721a50463',
 	tableId: 2,
 	foodName: 'Chicken sandwich'
+};
+
+const validStatus = {
+	...validOrder,
+	occurredAt: '2026-07-28T20:15:31Z'
 };
 
 describe('generated MQTT contracts', () => {
@@ -25,21 +30,41 @@ describe('generated MQTT contracts', () => {
 		expect(OrderRequestedSchema.safeParse(order).success).toBe(false);
 	});
 
-	it('accepts an offset-aware ready timestamp', () => {
-		expect(
-			FoodReadySchema.safeParse({
-				...validOrder,
-				readyAt: '2026-07-28T20:15:31Z'
-			}).success
-		).toBe(true);
+	it.each([
+		{ ...validStatus, status: 'queued' },
+		{ ...validStatus, status: 'processing' },
+		{
+			...validStatus,
+			status: 'food_ready',
+			readyAt: '2026-07-28T20:15:31Z'
+		},
+		{
+			...validStatus,
+			status: 'failed',
+			code: 'processing_failed',
+			message: 'The order could not be prepared.',
+			retryable: true
+		}
+	])('accepts an order status variant: %o', (update) => {
+		expect(OrderStatusChangedSchema.safeParse(update).success).toBe(true);
 	});
 
-	it('rejects a ready timestamp without a timezone', () => {
-		expect(
-			FoodReadySchema.safeParse({
-				...validOrder,
-				readyAt: '2026-07-28T20:15:31'
-			}).success
-		).toBe(false);
+	it.each([
+		{ ...validStatus, status: 'unknown' },
+		{ ...validStatus, status: 'food_ready' },
+		{
+			...validStatus,
+			status: 'food_ready',
+			readyAt: '2026-07-28T20:15:31'
+		},
+		{
+			...validStatus,
+			status: 'failed',
+			code: 'raw_exception',
+			message: 'unsafe',
+			retryable: true
+		}
+	])('rejects an invalid order status variant: %o', (update) => {
+		expect(OrderStatusChangedSchema.safeParse(update).success).toBe(false);
 	});
 });

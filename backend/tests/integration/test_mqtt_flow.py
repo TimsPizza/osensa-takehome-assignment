@@ -7,8 +7,13 @@ from uuid import uuid4
 import aiomqtt
 import pytest
 
-from app.models import FoodReady, OrderRequested
-from app.protocol import FOOD_READY_TOPIC, MQTT_QOS, ORDER_REQUESTED_TOPIC
+from app.models import FoodReady, OrderFailed, OrderRequested
+from app.protocol import (
+    MQTT_QOS,
+    ORDER_REQUESTED_TOPIC,
+    ORDER_STATUS_CHANGED_TOPIC,
+    decode_order_status_changed,
+)
 
 pytestmark = [
     pytest.mark.integration,
@@ -39,18 +44,28 @@ async def wait_until_backend_is_subscribed(client: aiomqtt.Client) -> None:
 async def wait_for_food(
     client: aiomqtt.Client,
     expected_order_ids: set[str],
-) -> dict[str, tuple[FoodReady, aiomqtt.Message]]:
+) -> tuple[
+    dict[str, tuple[FoodReady, aiomqtt.Message]],
+    dict[str, list[str]],
+]:
     received: dict[str, tuple[FoodReady, aiomqtt.Message]] = {}
+    statuses = {order_id: [] for order_id in expected_order_ids}
 
     async for message in client.messages:
-        if str(message.topic) != FOOD_READY_TOPIC:
+        if str(message.topic) != ORDER_STATUS_CHANGED_TOPIC:
             continue
-        food = FoodReady.model_validate_json(message.payload)
-        order_id = str(food.order_id)
-        if order_id in expected_order_ids:
-            received[order_id] = (food, message)
+        update = decode_order_status_changed(message.payload)
+        order_id = str(update.order_id)
+        if order_id not in expected_order_ids:
+            continue
+
+        statuses[order_id].append(update.status)
+        if isinstance(update, OrderFailed):
+            raise AssertionError(f"order {order_id} failed: {update.code}")
+        if isinstance(update, FoodReady):
+            received[order_id] = (update, message)
         if received.keys() == expected_order_ids:
-            return received
+            return received, statuses
 
     raise AssertionError("MQTT message stream ended before all FOOD_READY events arrived")
 
@@ -75,7 +90,7 @@ async def test_concurrent_orders_round_trip_over_websockets() -> None:
             transport="websockets",
             websocket_path=websocket_path,
         ) as client:
-            await client.subscribe(FOOD_READY_TOPIC, qos=MQTT_QOS)
+            await client.subscribe(ORDER_STATUS_CHANGED_TOPIC, qos=MQTT_QOS)
             await client.subscribe(SUBSCRIPTION_COUNT_TOPIC, qos=0)
             await wait_until_backend_is_subscribed(client)
 
@@ -97,7 +112,7 @@ async def test_concurrent_orders_round_trip_over_websockets() -> None:
                     retain=False,
                 )
 
-            received = await wait_for_food(client, set(expected))
+            received, statuses = await wait_for_food(client, set(expected))
 
     assert received.keys() == expected.keys()
     for order_id, expected_food in expected.items():
@@ -107,3 +122,4 @@ async def test_concurrent_orders_round_trip_over_websockets() -> None:
         assert food.ready_at.tzinfo is not None
         assert message.qos == MQTT_QOS
         assert message.retain is False
+        assert statuses[order_id] == ["queued", "processing", "food_ready"]

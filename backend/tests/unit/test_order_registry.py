@@ -43,6 +43,8 @@ def make_food() -> FoodReady:
         orderId=ORDER_ID,
         tableId=2,
         foodName="Chicken sandwich",
+        status="food_ready",
+        occurredAt=READY_AT,
         readyAt=READY_AT,
     )
 
