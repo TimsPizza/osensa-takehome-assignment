@@ -38,6 +38,7 @@ describe.skipIf(!runIntegration)('frontend MQTT integration', () => {
 						rejectFlow?.(new Error(`${status.code}: ${status.message}`));
 					}
 				},
+				onTableSnapshot: () => {},
 				onError: (message) => rejectFlow?.(new Error(message))
 			}
 		);
@@ -107,6 +108,7 @@ describe.skipIf(!runIntegration)('frontend MQTT integration', () => {
 						if (readyOrderIds.size === batch.length) resolveAllReady?.();
 					}
 				},
+				onTableSnapshot: () => {},
 				onError: (message) => rejectFlow?.(new Error(message))
 			}
 		);
@@ -134,6 +136,117 @@ describe.skipIf(!runIntegration)('frontend MQTT integration', () => {
 				(orderStatuses) => orderStatuses.join(',') === 'queued,processing,food_ready'
 			)
 		).toBe(true);
+	}, 20_000);
+
+	it('recovers a completed order in a brand-new clean-session client', async () => {
+		const orderId = crypto.randomUUID();
+		const mqttUrl = import.meta.env.VITE_MQTT_URL ?? 'ws://localhost:9001/mqtt';
+		let resolveObserverConnected: (() => void) | undefined;
+		let resolveOrderingConnected: (() => void) | undefined;
+		let resolveReady: (() => void) | undefined;
+		let resolveRecoveryConnected: (() => void) | undefined;
+		let resolveRecovered: (() => void) | undefined;
+		let recoveredStatus: OrderStatusChanged | undefined;
+		let rejectFlow: ((error: Error) => void) | undefined;
+
+		const observerConnected = new Promise<void>((resolve) => {
+			resolveObserverConnected = resolve;
+		});
+		const orderingConnected = new Promise<void>((resolve) => {
+			resolveOrderingConnected = resolve;
+		});
+		const ready = new Promise<void>((resolve) => {
+			resolveReady = resolve;
+		});
+		const recoveryConnected = new Promise<void>((resolve) => {
+			resolveRecoveryConnected = resolve;
+		});
+		const recovered = new Promise<void>((resolve) => {
+			resolveRecovered = resolve;
+		});
+		const flowFailure = new Promise<never>((_resolve, reject) => {
+			rejectFlow = reject;
+		});
+
+		const observer = new RestaurantMqttClient(mqttUrl, {
+			onConnectionChange: (state) => {
+				if (state === 'connected') resolveObserverConnected?.();
+			},
+			onOrderStatus: (status) => {
+				if (status.orderId !== orderId) return;
+				if (status.status === 'food_ready') resolveReady?.();
+				if (status.status === 'failed') {
+					rejectFlow?.(new Error(`${status.code}: ${status.message}`));
+				}
+			},
+			onTableSnapshot: () => {},
+			onError: (message) => rejectFlow?.(new Error(message))
+		});
+		const orderingClient = new RestaurantMqttClient(mqttUrl, {
+			onConnectionChange: (state) => {
+				if (state === 'connected') resolveOrderingConnected?.();
+			},
+			onOrderStatus: () => {},
+			onTableSnapshot: () => {},
+			onError: (message) => rejectFlow?.(new Error(message))
+		});
+		const recoveryClient = new RestaurantMqttClient(mqttUrl, {
+			onConnectionChange: (state) => {
+				if (state === 'connected') resolveRecoveryConnected?.();
+			},
+			onOrderStatus: () => {},
+			onTableSnapshot: (snapshot) => {
+				const status = snapshot.orders.find((order) => order.orderId === orderId);
+				if (status?.status !== 'food_ready') return;
+				recoveredStatus = status;
+				resolveRecovered?.();
+			},
+			onError: (message) => rejectFlow?.(new Error(message))
+		});
+
+		try {
+			observer.connect();
+			orderingClient.connect();
+			await withTimeout(
+				Promise.race([Promise.all([observerConnected, orderingConnected]), flowFailure]),
+				5_000,
+				'ordering clients did not connect'
+			);
+			await orderingClient.publishOrder({
+				schemaVersion: 1,
+				orderId,
+				tableId: 1,
+				foodName: 'Recovered browser soup'
+			});
+			await orderingClient.disconnect();
+
+			await withTimeout(
+				Promise.race([ready, flowFailure]),
+				10_000,
+				'order did not finish after the ordering client closed'
+			);
+			await observer.disconnect();
+
+			recoveryClient.connect();
+			await withTimeout(
+				Promise.race([Promise.all([recoveryConnected, recovered]), flowFailure]),
+				5_000,
+				'new client did not receive the retained table snapshot'
+			);
+		} finally {
+			await Promise.all([
+				observer.disconnect(),
+				orderingClient.disconnect(),
+				recoveryClient.disconnect()
+			]);
+		}
+
+		expect(recoveredStatus).toMatchObject({
+			orderId,
+			tableId: 1,
+			foodName: 'Recovered browser soup',
+			status: 'food_ready'
+		});
 	}, 20_000);
 });
 

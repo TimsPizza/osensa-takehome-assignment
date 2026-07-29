@@ -10,12 +10,14 @@ from uuid import uuid4
 import aiomqtt
 import pytest
 
-from app.models import FoodReady, OrderFailed, OrderRequested
+from app.models import FoodReady, OrderFailed, OrderRequested, TableSnapshot
 from app.protocol import (
     MQTT_QOS,
     ORDER_REQUESTED_TOPIC,
     ORDER_STATUS_CHANGED_TOPIC,
     decode_order_status_changed,
+    decode_table_snapshot,
+    table_snapshot_topic,
 )
 
 pytestmark = [
@@ -91,6 +93,24 @@ async def connected_client(
         yield client
 
 
+@asynccontextmanager
+async def snapshot_client(table_id: int) -> AsyncIterator[aiomqtt.Client]:
+    host = os.getenv("MQTT_TEST_HOST", "localhost")
+    port = int(os.getenv("MQTT_TEST_PORT", "9001"))
+    websocket_path = os.getenv("MQTT_TEST_WEBSOCKET_PATH", "/mqtt")
+
+    async with aiomqtt.Client(
+        hostname=host,
+        port=port,
+        identifier=f"snapshot-test-{uuid4()}",
+        clean_session=True,
+        transport="websockets",
+        websocket_path=websocket_path,
+    ) as client:
+        await client.subscribe(table_snapshot_topic(table_id), qos=MQTT_QOS)
+        yield client
+
+
 async def publish_payload(client: aiomqtt.Client, payload: bytes) -> None:
     await client.publish(
         ORDER_REQUESTED_TOPIC,
@@ -151,6 +171,18 @@ async def wait_for_one_food(
     raise AssertionError(f"MQTT message stream ended before order {order_id} was ready")
 
 
+async def wait_for_retained_snapshot(
+    client: aiomqtt.Client,
+    table_id: int,
+) -> tuple[TableSnapshot, aiomqtt.Message]:
+    expected_topic = table_snapshot_topic(table_id)
+    async for message in client.messages:
+        if str(message.topic) == expected_topic:
+            return decode_table_snapshot(message.payload), message
+
+    raise AssertionError(f"MQTT message stream ended before table {table_id} snapshot arrived")
+
+
 async def test_concurrent_orders_round_trip_over_websockets() -> None:
     expected = {
         str(uuid4()): ExpectedFood(table_id=1, food_name="Noodles"),
@@ -182,6 +214,38 @@ async def test_concurrent_orders_round_trip_over_websockets() -> None:
         assert message.qos == MQTT_QOS
         assert message.retain is False
         assert statuses[order_id] == ["queued", "processing", "food_ready"]
+
+
+async def test_new_client_recovers_food_completed_while_ordering_client_was_closed() -> None:
+    order_id = str(uuid4())
+    table_id = 4
+
+    async with asyncio.timeout(15):
+        async with connected_client() as completion_observer:
+            async with connected_client() as ordering_client:
+                await publish_payload(
+                    ordering_client,
+                    order_payload(
+                        order_id=order_id,
+                        table_id=table_id,
+                        food_name="Offline recovery soup",
+                    ),
+                )
+
+            food, statuses = await wait_for_one_food(completion_observer, order_id)
+
+        async with snapshot_client(table_id) as new_client:
+            snapshot, message = await wait_for_retained_snapshot(new_client, table_id)
+
+    recovered = next(
+        update for update in snapshot.orders if str(update.order_id) == order_id
+    )
+    assert statuses == ["queued", "processing", "food_ready"]
+    assert food.food_name == "Offline recovery soup"
+    assert isinstance(recovered, FoodReady)
+    assert recovered.ready_at == food.ready_at
+    assert message.qos == MQTT_QOS
+    assert message.retain is True
 
 
 async def test_malformed_and_invalid_orders_are_rejected_without_poisoning_flow() -> None:
