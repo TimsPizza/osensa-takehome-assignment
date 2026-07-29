@@ -10,8 +10,9 @@ test client <── FOOD ─── Mosquitto <── Python service
 
 The current milestone is a deliberately small, executable vertical slice. Pydantic
 models own the public wire contract, the frontend receives generated Zod schemas
-and TypeScript types, and Docker Compose proves the broker-to-backend path. The UI
-and simulated order processing are not implemented yet.
+and TypeScript types, and Docker Compose proves the broker-to-backend path. The
+backend processes up to four orders concurrently with a random one-to-five-second
+delay. The UI is not implemented yet.
 
 ## Prerequisites
 

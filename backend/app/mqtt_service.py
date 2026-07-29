@@ -1,12 +1,13 @@
 import asyncio
 import logging
-from datetime import UTC, datetime
+from typing import Protocol
 
 import aiomqtt
 from pydantic import ValidationError
 
 from app.config import Settings
-from app.models import FoodReady
+from app.models import FoodReady, OrderRequested
+from app.order_processor import OrderProcessor
 from app.protocol import (
     FOOD_READY_TOPIC,
     MQTT_QOS,
@@ -18,9 +19,29 @@ from app.protocol import (
 LOGGER = logging.getLogger(__name__)
 
 
+class Processor(Protocol):
+    async def process(self, order: OrderRequested) -> FoodReady: ...
+
+
 class MqttOrderService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        processor: Processor | None = None,
+        *,
+        max_concurrent_orders: int = 4,
+    ) -> None:
+        if max_concurrent_orders < 1:
+            raise ValueError("max_concurrent_orders must be greater than zero")
+
         self._settings = settings
+        self._processor = processor if processor is not None else OrderProcessor()
+        self._processing_slots = asyncio.Semaphore(max_concurrent_orders)
+        self._processing_tasks: set[asyncio.Task[None]] = set()
+        self._ready_food: asyncio.Queue[FoodReady] = asyncio.Queue(
+            maxsize=max_concurrent_orders,
+        )
+        self._pending_food: FoodReady | None = None
 
     def _client(self) -> aiomqtt.Client:
         return aiomqtt.Client(
@@ -39,41 +60,66 @@ class MqttOrderService:
     async def run(self) -> None:
         reconnect_delay = self._settings.reconnect_delay_seconds
 
-        while True:
-            try:
-                async with self._client() as client:
-                    await client.subscribe(ORDER_REQUESTED_TOPIC, qos=MQTT_QOS)
-                    reconnect_delay = self._settings.reconnect_delay_seconds
-                    LOGGER.info(
-                        "mqtt_subscribed topic=%s qos=%d transport=websockets",
-                        ORDER_REQUESTED_TOPIC,
-                        MQTT_QOS,
+        try:
+            while True:
+                try:
+                    async with self._client() as client:
+                        await client.subscribe(ORDER_REQUESTED_TOPIC, qos=MQTT_QOS)
+                        reconnect_delay = self._settings.reconnect_delay_seconds
+                        LOGGER.info(
+                            "mqtt_subscribed topic=%s qos=%d transport=websockets",
+                            ORDER_REQUESTED_TOPIC,
+                            MQTT_QOS,
+                        )
+                        await self._run_connected(client)
+                except asyncio.CancelledError:
+                    raise
+                except aiomqtt.MqttError as error:
+                    LOGGER.warning(
+                        "mqtt_connection_lost host=%s port=%d retry_seconds=%.1f error=%s",
+                        self._settings.mqtt_host,
+                        self._settings.mqtt_port,
+                        reconnect_delay,
+                        error,
                     )
 
-                    async for message in client.messages:
-                        await self._handle_message(client, message)
-            except asyncio.CancelledError:
-                raise
-            except aiomqtt.MqttError as error:
-                LOGGER.warning(
-                    "mqtt_connection_lost host=%s port=%d retry_seconds=%.1f error=%s",
-                    self._settings.mqtt_host,
-                    self._settings.mqtt_port,
-                    reconnect_delay,
-                    error,
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(
+                    reconnect_delay * 2,
+                    self._settings.reconnect_max_delay_seconds,
                 )
+        finally:
+            await self._cancel_processing_tasks()
 
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(
-                reconnect_delay * 2,
-                self._settings.reconnect_max_delay_seconds,
+    async def _run_connected(self, client: aiomqtt.Client) -> None:
+        connection_tasks = {
+            asyncio.create_task(
+                self._receive_orders(client),
+                name="mqtt-order-receiver",
+            ),
+            asyncio.create_task(
+                self._publish_ready_food(client),
+                name="mqtt-food-publisher",
+            ),
+        }
+
+        try:
+            done, _pending = await asyncio.wait(
+                connection_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            for task in done:
+                task.result()
+        finally:
+            for task in connection_tasks:
+                task.cancel()
+            await asyncio.gather(*connection_tasks, return_exceptions=True)
 
-    async def _handle_message(
-        self,
-        client: aiomqtt.Client,
-        message: aiomqtt.Message,
-    ) -> None:
+    async def _receive_orders(self, client: aiomqtt.Client) -> None:
+        async for message in client.messages:
+            await self._handle_message(message)
+
+    async def _handle_message(self, message: aiomqtt.Message) -> None:
         if str(message.topic) != ORDER_REQUESTED_TOPIC:
             LOGGER.warning("mqtt_unexpected_topic topic=%s", message.topic)
             return
@@ -92,22 +138,62 @@ class MqttOrderService:
             order.order_id,
             order.table_id,
         )
-        food = FoodReady(
-            schemaVersion=1,
-            orderId=order.order_id,
-            tableId=order.table_id,
-            foodName=order.food_name,
-            readyAt=datetime.now(UTC),
+
+        await self._processing_slots.acquire()
+        task = asyncio.create_task(
+            self._process_order(order),
+            name=f"order-{order.order_id}",
         )
-        await client.publish(
-            FOOD_READY_TOPIC,
-            payload=encode_food_ready(food),
-            qos=MQTT_QOS,
-            retain=False,
-        )
-        LOGGER.info(
-            "food_published order_id=%s table_id=%d topic=%s",
-            food.order_id,
-            food.table_id,
-            FOOD_READY_TOPIC,
-        )
+        self._processing_tasks.add(task)
+        task.add_done_callback(self._processing_tasks.discard)
+
+    async def _process_order(self, order: OrderRequested) -> None:
+        try:
+            LOGGER.info(
+                "order_processing_started order_id=%s table_id=%d",
+                order.order_id,
+                order.table_id,
+            )
+            food = await self._processor.process(order)
+            await self._ready_food.put(food)
+            LOGGER.info(
+                "order_processing_finished order_id=%s table_id=%d",
+                food.order_id,
+                food.table_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception(
+                "order_processing_failed order_id=%s table_id=%d",
+                order.order_id,
+                order.table_id,
+            )
+        finally:
+            self._processing_slots.release()
+
+    async def _publish_ready_food(self, client: aiomqtt.Client) -> None:
+        while True:
+            if self._pending_food is None:
+                self._pending_food = await self._ready_food.get()
+
+            food = self._pending_food
+            await client.publish(
+                FOOD_READY_TOPIC,
+                payload=encode_food_ready(food),
+                qos=MQTT_QOS,
+                retain=False,
+            )
+            LOGGER.info(
+                "food_published order_id=%s table_id=%d topic=%s",
+                food.order_id,
+                food.table_id,
+                FOOD_READY_TOPIC,
+            )
+            self._pending_food = None
+
+    async def _cancel_processing_tasks(self) -> None:
+        tasks = tuple(self._processing_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
