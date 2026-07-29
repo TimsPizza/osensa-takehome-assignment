@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from typing import Protocol
+from uuid import UUID
 
 import aiomqtt
 from pydantic import ValidationError
@@ -15,6 +16,7 @@ from app.order_state import (
     ProcessingFailed,
     ProcessingStarted,
     PublishConfirmed,
+    QueueAdmissionFailed,
 )
 from app.protocol import (
     FOOD_READY_TOPIC,
@@ -38,18 +40,23 @@ class MqttOrderService:
         processor: Processor | None = None,
         registry: OrderRegistry | None = None,
         *,
-        max_concurrent_orders: int = 4,
+        max_concurrent_orders: int = 8,
+        max_queued_orders: int = 256,
     ) -> None:
         if max_concurrent_orders < 1:
             raise ValueError("max_concurrent_orders must be greater than zero")
+        if max_queued_orders < 1:
+            raise ValueError("max_queued_orders must be greater than zero")
 
         self._settings = settings
         self._processor = processor if processor is not None else OrderProcessor()
         self._registry = registry if registry is not None else OrderRegistry()
-        self._processing_slots = asyncio.Semaphore(max_concurrent_orders)
-        self._processing_tasks: set[asyncio.Task[None]] = set()
+        self._worker_count = max_concurrent_orders
+        self._processing_queue: asyncio.Queue[UUID] = asyncio.Queue(
+            maxsize=max_queued_orders,
+        )
         self._ready_orders: asyncio.Queue[OrderState] = asyncio.Queue(
-            maxsize=max_concurrent_orders,
+            maxsize=max_concurrent_orders + max_queued_orders,
         )
         self._pending_order: OrderState | None = None
 
@@ -68,38 +75,47 @@ class MqttOrderService:
         )
 
     async def run(self) -> None:
+        async with asyncio.TaskGroup() as tasks:
+            for worker_number in range(1, self._worker_count + 1):
+                tasks.create_task(
+                    self._consume_orders(worker_number),
+                    name=f"order-worker-{worker_number}",
+                )
+            tasks.create_task(
+                self._maintain_connection(),
+                name="mqtt-connection-manager",
+            )
+
+    async def _maintain_connection(self) -> None:
         reconnect_delay = self._settings.reconnect_delay_seconds
 
-        try:
-            while True:
-                try:
-                    async with self._client() as client:
-                        await client.subscribe(ORDER_REQUESTED_TOPIC, qos=MQTT_QOS)
-                        reconnect_delay = self._settings.reconnect_delay_seconds
-                        LOGGER.info(
-                            "mqtt_subscribed topic=%s qos=%d transport=websockets",
-                            ORDER_REQUESTED_TOPIC,
-                            MQTT_QOS,
-                        )
-                        await self._run_connected(client)
-                except asyncio.CancelledError:
-                    raise
-                except aiomqtt.MqttError as error:
-                    LOGGER.warning(
-                        "mqtt_connection_lost host=%s port=%d retry_seconds=%.1f error=%s",
-                        self._settings.mqtt_host,
-                        self._settings.mqtt_port,
-                        reconnect_delay,
-                        error,
+        while True:
+            try:
+                async with self._client() as client:
+                    await client.subscribe(ORDER_REQUESTED_TOPIC, qos=MQTT_QOS)
+                    reconnect_delay = self._settings.reconnect_delay_seconds
+                    LOGGER.info(
+                        "mqtt_subscribed topic=%s qos=%d transport=websockets",
+                        ORDER_REQUESTED_TOPIC,
+                        MQTT_QOS,
                     )
-
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(
-                    reconnect_delay * 2,
-                    self._settings.reconnect_max_delay_seconds,
+                    await self._run_connected(client)
+            except asyncio.CancelledError:
+                raise
+            except aiomqtt.MqttError as error:
+                LOGGER.warning(
+                    "mqtt_connection_lost host=%s port=%d retry_seconds=%.1f error=%s",
+                    self._settings.mqtt_host,
+                    self._settings.mqtt_port,
+                    reconnect_delay,
+                    error,
                 )
-        finally:
-            await self._cancel_processing_tasks()
+
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(
+                reconnect_delay * 2,
+                self._settings.reconnect_max_delay_seconds,
+            )
 
     async def _run_connected(self, client: aiomqtt.Client) -> None:
         connection_tasks = {
@@ -149,11 +165,9 @@ class MqttOrderService:
             order.table_id,
         )
 
-        await self._processing_slots.acquire()
         registration = self._registry.register(order)
 
         if registration.action is RegistrationAction.IGNORE:
-            self._processing_slots.release()
             LOGGER.info(
                 "order_duplicate_ignored order_id=%s status=%s",
                 order.order_id,
@@ -162,7 +176,6 @@ class MqttOrderService:
             return
 
         if registration.action is RegistrationAction.CONFLICT:
-            self._processing_slots.release()
             LOGGER.warning(
                 "order_conflict order_id=%s existing_table_id=%d received_table_id=%d",
                 order.order_id,
@@ -172,7 +185,6 @@ class MqttOrderService:
             return
 
         if registration.action is RegistrationAction.REPUBLISH:
-            self._processing_slots.release()
             await self._ready_orders.put(registration.state)
             LOGGER.info(
                 "order_republish_scheduled order_id=%s status=%s",
@@ -181,39 +193,57 @@ class MqttOrderService:
             )
             return
 
-        processing_order = self._registry.apply(
-            order.order_id,
-            ProcessingStarted(),
-        )
-        task = asyncio.create_task(
-            self._process_order(processing_order),
-            name=f"order-{order.order_id}",
-        )
-        self._processing_tasks.add(task)
-        task.add_done_callback(self._processing_tasks.discard)
+        try:
+            self._processing_queue.put_nowait(order.order_id)
+        except asyncio.QueueFull:
+            failed_order = self._registry.apply(
+                order.order_id,
+                QueueAdmissionFailed("processing queue is full"),
+            )
+            LOGGER.warning(
+                "order_queue_admission_failed order_id=%s table_id=%d status=%s",
+                order.order_id,
+                order.table_id,
+                failed_order.status,
+            )
+            return
 
-    async def _process_order(self, processing_order: OrderState) -> None:
+        LOGGER.info(
+            "order_queued order_id=%s table_id=%d status=%s queue_size=%d",
+            order.order_id,
+            order.table_id,
+            registration.state.status,
+            self._processing_queue.qsize(),
+        )
+
+    async def _consume_orders(self, worker_number: int) -> None:
+        while True:
+            order_id = await self._processing_queue.get()
+            try:
+                processing_order = self._registry.apply(
+                    order_id,
+                    ProcessingStarted(),
+                )
+                await self._process_order(processing_order, worker_number)
+            finally:
+                self._processing_queue.task_done()
+
+    async def _process_order(
+        self,
+        processing_order: OrderState,
+        worker_number: int,
+    ) -> None:
         order = processing_order.order
 
         try:
             LOGGER.info(
-                "order_processing_started order_id=%s table_id=%d status=%s",
+                "order_processing_started order_id=%s table_id=%d status=%s worker=%d",
                 order.order_id,
                 order.table_id,
                 processing_order.status,
+                worker_number,
             )
             food = await self._processor.process(order)
-            ready_order = self._registry.apply(
-                order.order_id,
-                FoodPrepared(food),
-            )
-            await self._ready_orders.put(ready_order)
-            LOGGER.info(
-                "order_processing_finished order_id=%s table_id=%d status=%s",
-                food.order_id,
-                food.table_id,
-                ready_order.status,
-            )
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -229,8 +259,20 @@ class MqttOrderService:
                 failed_order.status,
                 failed_order.failure_reason,
             )
-        finally:
-            self._processing_slots.release()
+            return
+
+        ready_order = self._registry.apply(
+            order.order_id,
+            FoodPrepared(food),
+        )
+        await self._ready_orders.put(ready_order)
+        LOGGER.info(
+            "order_processing_finished order_id=%s table_id=%d status=%s worker=%d",
+            food.order_id,
+            food.table_id,
+            ready_order.status,
+            worker_number,
+        )
 
     async def _publish_ready_food(self, client: aiomqtt.Client) -> None:
         while True:
@@ -262,9 +304,3 @@ class MqttOrderService:
                 published_order.status,
             )
             self._pending_order = None
-
-    async def _cancel_processing_tasks(self) -> None:
-        tasks = tuple(self._processing_tasks)
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)

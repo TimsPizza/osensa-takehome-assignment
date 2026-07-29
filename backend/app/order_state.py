@@ -40,6 +40,11 @@ class ProcessingFailed:
 
 
 @dataclass(frozen=True, slots=True)
+class QueueAdmissionFailed:
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class PublishConfirmed:
     pass
 
@@ -58,6 +63,7 @@ type OrderEvent = (
     ProcessingStarted
     | FoodPrepared
     | ProcessingFailed
+    | QueueAdmissionFailed
     | PublishConfirmed
     | RetryRequested
     | RepublishRequested
@@ -106,6 +112,16 @@ def transition(current: OrderState, event: OrderEvent) -> OrderState:
             )
 
         case OrderStatus.PROCESSING, ProcessingFailed(reason=reason):
+            normalized_reason = reason.strip()
+            if not normalized_reason:
+                raise ValueError("failure reason must not be empty")
+            return replace(
+                current,
+                status=OrderStatus.FAILED,
+                failure_reason=normalized_reason,
+            )
+
+        case OrderStatus.QUEUED, QueueAdmissionFailed(reason=reason):
             normalized_reason = reason.strip()
             if not normalized_reason:
                 raise ValueError("failure reason must not be empty")
