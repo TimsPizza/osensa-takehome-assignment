@@ -11,6 +11,7 @@ import type { TableId } from '$lib/order-state';
 type PublishOrder = (order: OrderRequested) => Promise<void>;
 type RunStatus = 'idle' | 'publishing' | 'observing' | 'completed' | 'failed';
 type SaturationStatus = 'idle' | 'running' | 'completed' | 'stopped' | 'failed';
+type OverloadStatus = 'idle' | 'running' | 'observing' | 'passed' | 'stopped' | 'failed';
 
 export interface BurstRun {
 	status: RunStatus;
@@ -57,6 +58,30 @@ export interface SaturationOptions {
 	maxOrdersPerSecond: number;
 }
 
+export interface OverloadRun {
+	status: OverloadStatus;
+	durationSeconds: number;
+	ordersPerSecond: number;
+	observationSeconds: number;
+	published: number;
+	publishFailed: number;
+	accepted: number;
+	overloaded: number;
+	terminal: number;
+	ghosts: number;
+	ghostOrderIds: string[];
+	startedAt?: number;
+	trafficStoppedAt?: number;
+	finishedAt?: number;
+	error?: string;
+}
+
+export interface OverloadOptions {
+	durationSeconds: number;
+	ordersPerSecond: number;
+	observationSeconds: number;
+}
+
 interface ControllerOptions {
 	now?: () => number;
 	wait?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
@@ -93,10 +118,25 @@ const EMPTY_SATURATION: SaturationRun = {
 	terminal: 0
 };
 
+const EMPTY_OVERLOAD: OverloadRun = {
+	status: 'idle',
+	durationSeconds: 10,
+	ordersPerSecond: 100,
+	observationSeconds: 10,
+	published: 0,
+	publishFailed: 0,
+	accepted: 0,
+	overloaded: 0,
+	terminal: 0,
+	ghosts: 0,
+	ghostOrderIds: []
+};
+
 export class BoundaryTestController {
 	readonly burst = writable<BurstRun>({ ...EMPTY_BURST });
 	readonly idempotency = writable<IdempotencyRun>({ ...EMPTY_IDEMPOTENCY });
 	readonly saturation = writable<SaturationRun>({ ...EMPTY_SATURATION });
+	readonly overload = writable<OverloadRun>({ ...EMPTY_OVERLOAD });
 	readonly pressure: Readable<KitchenPressureSnapshot | undefined>;
 
 	readonly #publishOrder: PublishOrder;
@@ -112,11 +152,17 @@ export class BoundaryTestController {
 	readonly #saturationOrderIds = new Set<string>();
 	readonly #saturationAccepted = new Set<string>();
 	readonly #saturationOverloaded = new Set<string>();
+	readonly #overloadOrderIds = new Set<string>();
+	readonly #overloadAccepted = new Set<string>();
+	readonly #overloadRejected = new Set<string>();
+	readonly #overloadTerminal = new Set<string>();
+	readonly #overloadGhosts = new Set<string>();
 	readonly #idempotencyStatuses = new Set<OrderStatusChanged['status']>();
 	#idempotencyOrderId?: string;
 	#idempotencyTimeout?: ReturnType<typeof setTimeout>;
 	#burstTimeout?: ReturnType<typeof setTimeout>;
 	#saturationAbort?: AbortController;
+	#overloadAbort?: AbortController;
 
 	constructor(publishOrder: PublishOrder, options: ControllerOptions = {}) {
 		this.#publishOrder = publishOrder;
@@ -129,12 +175,18 @@ export class BoundaryTestController {
 
 	handlePressure(snapshot: KitchenPressureSnapshot): void {
 		this.#pressure.set(snapshot);
+		for (const worker of snapshot.workers) {
+			if (worker.status === 'processing' && this.#overloadRejected.has(worker.orderId)) {
+				this.#recordOverloadGhost(worker.orderId, 'A rejected order appeared in worker telemetry.');
+			}
+		}
 	}
 
 	handleOrderStatus(update: OrderStatusChanged): void {
 		this.#handleBurstStatus(update);
 		this.#handleIdempotencyStatus(update);
 		this.#handleSaturationStatus(update);
+		this.#handleOverloadStatus(update);
 	}
 
 	async runRandomBurst(count: number): Promise<void> {
@@ -314,10 +366,101 @@ export class BoundaryTestController {
 		}));
 	}
 
+	async startOverload(options: OverloadOptions): Promise<void> {
+		validateOverloadOptions(options);
+		this.stopOverload();
+		this.#clearOverload();
+		const abort = new AbortController();
+		this.#overloadAbort = abort;
+		const startedAt = this.#now();
+		const warmupOvershoot = Math.max(1, Math.ceil(options.ordersPerSecond / 4));
+		let publishBudget = 0;
+		this.overload.set({
+			...EMPTY_OVERLOAD,
+			...options,
+			status: 'running',
+			startedAt
+		});
+
+		try {
+			const pressure = get(this.#pressure);
+			if (pressure) {
+				const warmupCount = Math.min(
+					500,
+					Math.max(
+						warmupOvershoot,
+						pressure.queueCapacity -
+							pressure.queuedOrders +
+							pressure.workers.length +
+							warmupOvershoot
+					)
+				);
+				await this.#publishOverloadBatch(warmupCount);
+			}
+
+			while (!abort.signal.aborted && this.#now() - startedAt < options.durationSeconds * 1_000) {
+				publishBudget += options.ordersPerSecond / 4;
+				const orderCount = Math.floor(publishBudget);
+				publishBudget -= orderCount;
+				if (orderCount > 0) {
+					await this.#publishOverloadBatch(orderCount);
+				}
+				await this.#wait(250, abort.signal);
+			}
+
+			if (abort.signal.aborted) {
+				return;
+			}
+
+			this.overload.update((run) => ({
+				...run,
+				status: 'observing',
+				trafficStoppedAt: this.#now()
+			}));
+			await this.#wait(options.observationSeconds * 1_000, abort.signal);
+			if (!abort.signal.aborted) {
+				this.#finishOverloadObservation();
+			}
+		} catch (error) {
+			if (!abort.signal.aborted) {
+				this.overload.update((run) => ({
+					...run,
+					status: 'failed',
+					finishedAt: this.#now(),
+					error: error instanceof Error ? error.message : 'Overload test failed.'
+				}));
+			}
+		} finally {
+			if (this.#overloadAbort === abort) {
+				this.#overloadAbort = undefined;
+			}
+		}
+	}
+
+	stopOverload(): void {
+		const abort = this.#overloadAbort;
+		if (!abort) {
+			return;
+		}
+		abort.abort();
+		this.#overloadAbort = undefined;
+		this.overload.update((run) =>
+			run.status === 'running' || run.status === 'observing'
+				? {
+						...run,
+						status: 'stopped',
+						finishedAt: this.#now()
+					}
+				: run
+		);
+	}
+
 	destroy(): void {
 		this.stopSaturation();
+		this.stopOverload();
 		this.#clearBurst();
 		this.#clearIdempotency();
+		this.#clearOverload();
 	}
 
 	#createOrders(count: number): OrderRequested[] {
@@ -344,6 +487,25 @@ export class BoundaryTestController {
 			}
 		}
 		this.saturation.update((run) => ({
+			...run,
+			published: run.published + published,
+			publishFailed: run.publishFailed + (count - published)
+		}));
+	}
+
+	async #publishOverloadBatch(count: number): Promise<void> {
+		const orders = this.#createOrders(count);
+		for (const order of orders) {
+			this.#overloadOrderIds.add(order.orderId);
+		}
+		const results = await Promise.allSettled(orders.map((order) => this.#publishOrder(order)));
+		const published = results.filter((result) => result.status === 'fulfilled').length;
+		for (const [index, result] of results.entries()) {
+			if (result.status === 'rejected') {
+				this.#overloadOrderIds.delete(orders[index].orderId);
+			}
+		}
+		this.overload.update((run) => ({
 			...run,
 			published: run.published + published,
 			publishFailed: run.publishFailed + (count - published)
@@ -441,6 +603,73 @@ export class BoundaryTestController {
 		}
 	}
 
+	#handleOverloadStatus(update: OrderStatusChanged): void {
+		if (!this.#overloadOrderIds.has(update.orderId)) {
+			return;
+		}
+
+		const wasRejected = this.#overloadRejected.has(update.orderId);
+		const isOverloadFailure = update.status === 'failed' && update.code === 'service_overloaded';
+		if (update.status === 'queued') {
+			this.#overloadAccepted.add(update.orderId);
+		}
+		if (isOverloadFailure) {
+			this.#overloadRejected.add(update.orderId);
+		}
+		if (update.status === 'food_ready' || update.status === 'failed') {
+			this.#overloadTerminal.add(update.orderId);
+		}
+		if (wasRejected && !isOverloadFailure) {
+			this.#recordOverloadGhost(
+				update.orderId,
+				`Rejected order later transitioned to ${update.status}.`
+			);
+		}
+		this.overload.update((run) => ({
+			...run,
+			accepted: this.#overloadAccepted.size,
+			overloaded: this.#overloadRejected.size,
+			terminal: this.#overloadTerminal.size,
+			ghosts: this.#overloadGhosts.size,
+			ghostOrderIds: [...this.#overloadGhosts]
+		}));
+	}
+
+	#recordOverloadGhost(orderId: string, message: string): void {
+		if (this.#overloadGhosts.has(orderId)) {
+			return;
+		}
+		this.#overloadGhosts.add(orderId);
+		this.#overloadAbort?.abort();
+		this.overload.update((run) => ({
+			...run,
+			status: 'failed',
+			ghosts: this.#overloadGhosts.size,
+			ghostOrderIds: [...this.#overloadGhosts],
+			finishedAt: this.#now(),
+			error: message
+		}));
+	}
+
+	#finishOverloadObservation(): void {
+		const run = get(this.overload);
+		if (run.ghosts > 0) {
+			return;
+		}
+		const passed = run.overloaded > 0;
+		this.overload.update((current) => ({
+			...current,
+			status: passed ? 'passed' : 'failed',
+			finishedAt: this.#now(),
+			...(passed
+				? {}
+				: {
+						error:
+							'No service_overloaded response was observed; the rejection boundary was not proven.'
+					})
+		}));
+	}
+
 	#clearBurst(): void {
 		if (this.#burstTimeout) clearTimeout(this.#burstTimeout);
 		this.#burstTimeout = undefined;
@@ -455,6 +684,14 @@ export class BoundaryTestController {
 		this.#idempotencyTimeout = undefined;
 		this.#idempotencyOrderId = undefined;
 		this.#idempotencyStatuses.clear();
+	}
+
+	#clearOverload(): void {
+		this.#overloadOrderIds.clear();
+		this.#overloadAccepted.clear();
+		this.#overloadRejected.clear();
+		this.#overloadTerminal.clear();
+		this.#overloadGhosts.clear();
 	}
 }
 
@@ -479,6 +716,30 @@ function validateSaturationOptions(options: SaturationOptions): void {
 		options.maxOrdersPerSecond > 200
 	) {
 		throw new RangeError('maxOrdersPerSecond must be between 1 and 200');
+	}
+}
+
+function validateOverloadOptions(options: OverloadOptions): void {
+	if (
+		!Number.isInteger(options.durationSeconds) ||
+		options.durationSeconds < 5 ||
+		options.durationSeconds > 30
+	) {
+		throw new RangeError('durationSeconds must be between 5 and 30');
+	}
+	if (
+		!Number.isInteger(options.ordersPerSecond) ||
+		options.ordersPerSecond < 20 ||
+		options.ordersPerSecond > 200
+	) {
+		throw new RangeError('ordersPerSecond must be between 20 and 200');
+	}
+	if (
+		!Number.isInteger(options.observationSeconds) ||
+		options.observationSeconds < 5 ||
+		options.observationSeconds > 60
+	) {
+		throw new RangeError('observationSeconds must be between 5 and 60');
 	}
 }
 

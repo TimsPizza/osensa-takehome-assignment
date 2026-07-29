@@ -7,6 +7,7 @@ import { RestaurantMqttClient } from '$lib/mqtt-client';
 import { createRandomOrders } from '$lib/random-orders';
 
 const runIntegration = import.meta.env.VITE_RUN_MQTT_INTEGRATION === '1';
+const runLoad = import.meta.env.VITE_RUN_MQTT_LOAD === '1';
 
 describe.skipIf(!runIntegration)('frontend MQTT integration', () => {
 	it('publishes an order and receives its complete lifecycle', async () => {
@@ -363,6 +364,77 @@ describe.skipIf(!runIntegration)('frontend MQTT integration', () => {
 			status: 'food_ready'
 		});
 	}, 20_000);
+
+	it.runIf(runLoad)(
+		'sustains overload without allowing rejected orders to become ghost work',
+		async () => {
+			let resolveConnected: (() => void) | undefined;
+			let resolvePressure: (() => void) | undefined;
+			let rejectFlow: ((error: Error) => void) | undefined;
+			const connection: { client?: RestaurantMqttClient } = {};
+
+			const connected = new Promise<void>((resolve) => {
+				resolveConnected = resolve;
+			});
+			const pressureReceived = new Promise<void>((resolve) => {
+				resolvePressure = resolve;
+			});
+			const flowFailure = new Promise<never>((_resolve, reject) => {
+				rejectFlow = reject;
+			});
+			const controller = new BoundaryTestController((order) => {
+				if (!connection.client) throw new Error('MQTT client is not ready');
+				return connection.client.publishOrder(order);
+			});
+			const client = new RestaurantMqttClient(
+				import.meta.env.VITE_MQTT_URL ?? 'ws://localhost:9001/mqtt',
+				{
+					onConnectionChange: (state) => {
+						if (state === 'connected') resolveConnected?.();
+					},
+					onOrderStatus: (status) => controller.handleOrderStatus(status),
+					onTableSnapshot: () => {},
+					onKitchenPressure: (snapshot) => {
+						controller.handlePressure(snapshot);
+						resolvePressure?.();
+					},
+					onError: (message) => rejectFlow?.(new Error(message))
+				}
+			);
+			connection.client = client;
+
+			try {
+				client.connect();
+				await withTimeout(
+					Promise.race([Promise.all([connected, pressureReceived]), flowFailure]),
+					5_000,
+					'frontend MQTT pressure connection timed out'
+				);
+				await withTimeout(
+					Promise.race([
+						controller.startOverload({
+							durationSeconds: 5,
+							ordersPerSecond: 100,
+							observationSeconds: 5
+						}),
+						flowFailure
+					]),
+					20_000,
+					'overload ghost test timed out'
+				);
+
+				expect(get(controller.overload)).toMatchObject({
+					status: 'passed',
+					ghosts: 0
+				});
+				expect(get(controller.overload).overloaded).toBeGreaterThan(0);
+			} finally {
+				controller.destroy();
+				await client.disconnect();
+			}
+		},
+		25_000
+	);
 });
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
