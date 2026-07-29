@@ -7,7 +7,12 @@ from uuid import UUID
 from app.config import Settings
 from app.models import FoodReady, OrderRequested
 from app.mqtt_service import MqttOrderService
-from app.order_state import OrderStatus
+from app.order_state import (
+    FoodPrepared,
+    OrderStatus,
+    ProcessingStarted,
+    PublishConfirmed,
+)
 from app.protocol import ORDER_REQUESTED_TOPIC
 
 FIRST_ORDER_ID = UUID("3b11d31c-7d34-4dda-91e5-d64721a50463")
@@ -47,12 +52,14 @@ def make_message(order_id: UUID, table_id: int) -> SimpleNamespace:
 class GatedProcessor:
     def __init__(self, expected_concurrency: int) -> None:
         self.active = 0
+        self.calls = 0
         self.max_active = 0
         self.all_started = asyncio.Event()
         self.release = asyncio.Event()
         self.expected_concurrency = expected_concurrency
 
     async def process(self, order: OrderRequested) -> FoodReady:
+        self.calls += 1
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         if self.active == self.expected_concurrency:
@@ -105,3 +112,75 @@ async def test_orders_run_concurrently_with_bounded_backpressure() -> None:
         SECOND_ORDER_ID,
         THIRD_ORDER_ID,
     }
+
+
+async def test_duplicate_processing_order_is_not_processed_twice() -> None:
+    processor = GatedProcessor(expected_concurrency=1)
+    service = MqttOrderService(
+        make_settings(),
+        processor,
+        max_concurrent_orders=2,
+    )
+    message = make_message(FIRST_ORDER_ID, 1)
+
+    await service._handle_message(message)
+    await asyncio.wait_for(processor.all_started.wait(), timeout=1)
+    await service._handle_message(message)
+
+    assert processor.calls == 1
+
+    processor.release.set()
+    ready_order = await asyncio.wait_for(service._ready_orders.get(), timeout=1)
+    await asyncio.gather(*tuple(service._processing_tasks))
+
+    assert ready_order.status is OrderStatus.FOOD_READY
+    assert ready_order.order.order_id == FIRST_ORDER_ID
+    assert processor.calls == 1
+
+
+async def test_conflicting_payload_does_not_start_another_processor() -> None:
+    processor = GatedProcessor(expected_concurrency=1)
+    service = MqttOrderService(
+        make_settings(),
+        processor,
+        max_concurrent_orders=2,
+    )
+
+    await service._handle_message(make_message(FIRST_ORDER_ID, 1))
+    await asyncio.wait_for(processor.all_started.wait(), timeout=1)
+    await service._handle_message(make_message(FIRST_ORDER_ID, 3))
+
+    assert processor.calls == 1
+
+    processor.release.set()
+    ready_order = await asyncio.wait_for(service._ready_orders.get(), timeout=1)
+    await asyncio.gather(*tuple(service._processing_tasks))
+
+    assert ready_order.order.table_id == 1
+    assert service._registry.get(FIRST_ORDER_ID) is ready_order
+    assert processor.calls == 1
+
+
+async def test_duplicate_published_order_requeues_cached_food_without_processing() -> None:
+    processor = GatedProcessor(expected_concurrency=1)
+    service = MqttOrderService(make_settings(), processor)
+    message = make_message(FIRST_ORDER_ID, 1)
+    order = OrderRequested.model_validate_json(message.payload)
+    food = FoodReady(
+        schemaVersion=1,
+        orderId=order.order_id,
+        tableId=order.table_id,
+        foodName=order.food_name,
+        readyAt=READY_AT,
+    )
+    service._registry.register(order)
+    service._registry.apply(order.order_id, ProcessingStarted())
+    service._registry.apply(order.order_id, FoodPrepared(food))
+    service._registry.apply(order.order_id, PublishConfirmed())
+
+    await service._handle_message(message)
+
+    ready_order = await asyncio.wait_for(service._ready_orders.get(), timeout=1)
+    assert ready_order.status is OrderStatus.FOOD_READY
+    assert ready_order.food is food
+    assert processor.calls == 0
