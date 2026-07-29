@@ -19,8 +19,8 @@ def utc_now() -> datetime:
 class OrderProcessor:
     """Turn one validated order into food after a non-blocking delay."""
 
-    min_delay_seconds: float = 1.0
-    max_delay_seconds: float = 5.0
+    min_delay_seconds: float = 0.5
+    max_delay_seconds: float = 2.5
     delay_sampler: DelaySampler = random.uniform
     sleeper: Sleeper = asyncio.sleep
     clock: Clock = utc_now
