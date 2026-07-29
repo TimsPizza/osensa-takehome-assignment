@@ -1,0 +1,19 @@
+{
+	email {$ACME_EMAIL}
+}
+
+{$MQTT_DOMAIN} {
+	route /mqtt* {
+		@allowed_origin header Origin {$FRONTEND_ORIGIN}
+		reverse_proxy @allowed_origin broker:9001
+		respond 403
+	}
+
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	respond 404
+
+	log {
+		output stdout
+		format json
+	}
+}

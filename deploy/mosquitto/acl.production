@@ -1,0 +1,32 @@
+user restaurant-console
+topic write restaurant/v1/table/+/order/requested
+topic read restaurant/v1/table/+/order/status-changed
+topic read restaurant/v1/table/+/snapshot
+topic read restaurant/v1/kitchen/pressure
+
+user restaurant-backend
+topic read restaurant/v1/table/+/order/requested
+topic write restaurant/v1/table/+/order/status-changed
+topic write restaurant/v1/table/+/snapshot
+topic write restaurant/v1/kitchen/pressure
+topic read $SYS/broker/version
+
+user table-1
+topic write restaurant/v1/table/1/order/requested
+topic read restaurant/v1/table/1/order/status-changed
+topic read restaurant/v1/table/1/snapshot
+
+user table-2
+topic write restaurant/v1/table/2/order/requested
+topic read restaurant/v1/table/2/order/status-changed
+topic read restaurant/v1/table/2/snapshot
+
+user table-3
+topic write restaurant/v1/table/3/order/requested
+topic read restaurant/v1/table/3/order/status-changed
+topic read restaurant/v1/table/3/snapshot
+
+user table-4
+topic write restaurant/v1/table/4/order/requested
+topic read restaurant/v1/table/4/order/status-changed
+topic read restaurant/v1/table/4/snapshot

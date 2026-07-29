@@ -1,0 +1,84 @@
+services:
+  broker:
+    ports: !reset []
+    volumes:
+      - ./deploy/mosquitto/mosquitto.production.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./deploy/mosquitto/acl.production:/mosquitto/config/acl.production:ro
+    secrets:
+      - mosquitto_passwords
+      - mqtt_backend_password
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mosquitto_sub --ws -h localhost -p 9001 -u restaurant-backend -P \"$$(cat /run/secrets/mqtt_backend_password)\" -t '$$SYS/broker/version' -C 1 -W 3",
+        ]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    pids_limit: 100
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  backend:
+    environment:
+      MQTT_USERNAME: restaurant-backend
+      MQTT_PASSWORD_FILE: /run/secrets/mqtt_backend_password
+    secrets:
+      - mqtt_backend_password
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 100
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  caddy:
+    image: caddy:2.11.3-alpine
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      MQTT_DOMAIN: "${MQTT_DOMAIN:?set MQTT_DOMAIN in the production env file}"
+      FRONTEND_ORIGIN: "${FRONTEND_ORIGIN:?set FRONTEND_ORIGIN in the production env file}"
+      ACME_EMAIL: "${ACME_EMAIL:?set ACME_EMAIL in the production env file}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      broker:
+        condition: service_healthy
+    mem_limit: 128m
+    pids_limit: 100
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+secrets:
+  mosquitto_passwords:
+    file: ./deploy/secrets/mosquitto-passwords
+  mqtt_backend_password:
+    file: ./deploy/secrets/mqtt-restaurant-backend-password
+
+volumes:
+  caddy_data:
+  caddy_config:
