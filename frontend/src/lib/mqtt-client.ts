@@ -3,12 +3,16 @@ import mqtt, { type MqttClient } from 'mqtt';
 import {
 	OrderRequestedSchema,
 	OrderStatusChangedSchema,
+	TableSnapshotSchema,
 	type OrderRequested,
-	type OrderStatusChanged
+	type OrderStatusChanged,
+	type TableSnapshot
 } from '$lib/generated/contracts';
 
 const ORDER_REQUESTED_TOPIC = 'restaurant/v1/order/requested';
 const ORDER_STATUS_CHANGED_TOPIC = 'restaurant/v1/order/status-changed';
+const TABLE_SNAPSHOT_TOPIC_FILTER = 'restaurant/v1/table/+/snapshot';
+const TABLE_SNAPSHOT_TOPIC = /^restaurant\/v1\/table\/([1-4])\/snapshot$/;
 const MQTT_QOS = 1 as const;
 
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'offline';
@@ -16,6 +20,7 @@ export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'off
 export interface MqttClientCallbacks {
 	onConnectionChange: (state: ConnectionState) => void;
 	onOrderStatus: (status: OrderStatusChanged) => void;
+	onTableSnapshot: (snapshot: TableSnapshot) => void;
 	onError: (message: string) => void;
 }
 
@@ -41,6 +46,31 @@ export function decodeOrderStatusPayload(payload: Uint8Array): OrderStatusChange
 		const decoded: unknown = JSON.parse(new TextDecoder().decode(payload));
 		const result = OrderStatusChangedSchema.safeParse(decoded);
 		return result.success ? result.data : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export function decodeTableSnapshotPayload(
+	topic: string,
+	payload: Uint8Array
+): TableSnapshot | undefined {
+	const topicMatch = TABLE_SNAPSHOT_TOPIC.exec(topic);
+	if (!topicMatch) {
+		return undefined;
+	}
+
+	try {
+		const decoded: unknown = JSON.parse(new TextDecoder().decode(payload));
+		const result = TableSnapshotSchema.safeParse(decoded);
+		if (
+			!result.success ||
+			result.data.tableId !== Number(topicMatch[1]) ||
+			result.data.orders.some((order) => order.tableId !== result.data.tableId)
+		) {
+			return undefined;
+		}
+		return result.data;
 	} catch {
 		return undefined;
 	}
@@ -79,11 +109,13 @@ export class RestaurantMqttClient {
 
 		client.on('connect', () => {
 			void client
-				.subscribeAsync(ORDER_STATUS_CHANGED_TOPIC, { qos: MQTT_QOS })
+				.subscribeAsync([ORDER_STATUS_CHANGED_TOPIC, TABLE_SNAPSHOT_TOPIC_FILTER], {
+					qos: MQTT_QOS
+				})
 				.then(() => {
 					this.#setState('connected');
 					console.info('mqtt_subscribed', {
-						topic: ORDER_STATUS_CHANGED_TOPIC,
+						topics: [ORDER_STATUS_CHANGED_TOPIC, TABLE_SNAPSHOT_TOPIC_FILTER],
 						qos: MQTT_QOS
 					});
 				})
@@ -93,17 +125,28 @@ export class RestaurantMqttClient {
 		});
 
 		client.on('message', (topic, payload) => {
-			if (topic !== ORDER_STATUS_CHANGED_TOPIC) {
+			if (topic === ORDER_STATUS_CHANGED_TOPIC) {
+				const status = decodeOrderStatusPayload(payload);
+				if (!status) {
+					console.warn('mqtt_status_rejected', { topic });
+					this.#callbacks.onError('An invalid order update was ignored.');
+					return;
+				}
+				this.#callbacks.onOrderStatus(status);
 				return;
 			}
 
-			const status = decodeOrderStatusPayload(payload);
-			if (!status) {
-				console.warn('mqtt_status_rejected', { topic });
-				this.#callbacks.onError('An invalid order update was ignored.');
+			if (!TABLE_SNAPSHOT_TOPIC.test(topic)) {
 				return;
 			}
-			this.#callbacks.onOrderStatus(status);
+
+			const snapshot = decodeTableSnapshotPayload(topic, payload);
+			if (!snapshot) {
+				console.warn('mqtt_snapshot_rejected', { topic });
+				this.#callbacks.onError('An invalid table snapshot was ignored.');
+				return;
+			}
+			this.#callbacks.onTableSnapshot(snapshot);
 		});
 
 		client.on('reconnect', () => this.#setState('reconnecting'));

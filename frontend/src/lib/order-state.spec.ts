@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import type { OrderStatusChanged } from '$lib/generated/contracts';
+import type { OrderStatusChanged, TableSnapshot } from '$lib/generated/contracts';
 import {
 	addSendingOrder,
 	applyOrderStatus,
 	markSendFailed,
+	replaceTableFromSnapshot,
+	shouldApplyTableSnapshot,
 	type OrderView
 } from '$lib/order-state';
 
@@ -123,4 +125,78 @@ describe('order view reducer', () => {
 			retryable: true
 		});
 	});
+
+	it('replaces one table from an authoritative retained snapshot', () => {
+		const oldOrder: OrderView = {
+			orderId: '4a22d42d-8e45-4eeb-a2f6-e75832b61574',
+			tableId: 2,
+			foodName: 'Old soup',
+			status: 'food_ready'
+		};
+		const otherTable: OrderView = {
+			orderId: '5b33e53e-9f56-4ffc-b307-f86943c72685',
+			tableId: 3,
+			foodName: 'Other table pizza',
+			status: 'processing'
+		};
+		const snapshot = tableSnapshot({
+			orders: [
+				{
+					...baseStatus,
+					status: 'food_ready',
+					readyAt: '2026-07-29T18:00:03Z'
+				}
+			]
+		});
+
+		const replaced = replaceTableFromSnapshot([oldOrder, otherTable], snapshot);
+
+		expect(replaced.map((order) => order.orderId)).toEqual([orderId, otherTable.orderId]);
+		expect(replaced[0].status).toBe('food_ready');
+	});
+
+	it('preserves unsynchronized local orders when a snapshot arrives', () => {
+		const sending = addSendingOrder([], {
+			orderId: '4a22d42d-8e45-4eeb-a2f6-e75832b61574',
+			tableId: 2,
+			foodName: 'Still sending'
+		});
+
+		expect(replaceTableFromSnapshot(sending, tableSnapshot()).at(0)).toMatchObject({
+			status: 'sending',
+			foodName: 'Still sending'
+		});
+	});
+
+	it('accepts a newer revision or a new service instance and rejects stale snapshots', () => {
+		const current = {
+			serviceInstanceId: '1058bf2e-0ef0-4ae6-a3bc-267f1abbbd54',
+			revision: 3
+		};
+
+		expect(shouldApplyTableSnapshot(tableSnapshot({ revision: 4 }), current)).toBe(true);
+		expect(shouldApplyTableSnapshot(tableSnapshot({ revision: 3 }), current)).toBe(false);
+		expect(shouldApplyTableSnapshot(tableSnapshot({ revision: 2 }), current)).toBe(false);
+		expect(
+			shouldApplyTableSnapshot(
+				tableSnapshot({
+					serviceInstanceId: 'ad0716a0-ad7e-451f-9198-a014e60bc68c',
+					revision: 0
+				}),
+				current
+			)
+		).toBe(true);
+	});
 });
+
+function tableSnapshot(overrides: Partial<TableSnapshot> = {}): TableSnapshot {
+	return {
+		schemaVersion: 1,
+		serviceInstanceId: '1058bf2e-0ef0-4ae6-a3bc-267f1abbbd54',
+		tableId: 2,
+		revision: 0,
+		generatedAt: '2026-07-29T18:00:04Z',
+		orders: [],
+		...overrides
+	};
+}

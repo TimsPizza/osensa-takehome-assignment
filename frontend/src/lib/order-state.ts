@@ -1,4 +1,4 @@
-import type { OrderStatusChanged } from '$lib/generated/contracts';
+import type { OrderStatusChanged, TableSnapshot } from '$lib/generated/contracts';
 
 export type TableId = 1 | 2 | 3 | 4;
 export type OrderViewStatus = 'sending' | 'send_failed' | OrderStatusChanged['status'];
@@ -12,6 +12,11 @@ export interface OrderView {
 	readyAt?: string;
 	failureMessage?: string;
 	retryable?: boolean;
+}
+
+export interface TableSnapshotCursor {
+	serviceInstanceId: string;
+	revision: number;
 }
 
 const STATUS_RANK: Record<OrderViewStatus, number> = {
@@ -71,6 +76,33 @@ export function applyOrderStatus(
 	}
 
 	return orders.map((order) => (order.orderId === update.orderId ? next : order));
+}
+
+export function shouldApplyTableSnapshot(
+	snapshot: TableSnapshot,
+	current?: TableSnapshotCursor
+): boolean {
+	return (
+		!current ||
+		current.serviceInstanceId !== snapshot.serviceInstanceId ||
+		snapshot.revision > current.revision
+	);
+}
+
+export function replaceTableFromSnapshot(
+	orders: readonly OrderView[],
+	snapshot: TableSnapshot
+): OrderView[] {
+	const snapshotOrderIds = new Set(snapshot.orders.map((order) => order.orderId));
+	const localOnlyOrders = orders.filter(
+		(order) =>
+			order.tableId === snapshot.tableId &&
+			(order.status === 'sending' || order.status === 'send_failed') &&
+			!snapshotOrderIds.has(order.orderId)
+	);
+	const otherTables = orders.filter((order) => order.tableId !== snapshot.tableId);
+
+	return [...snapshot.orders.map(fromStatusUpdate), ...localOnlyOrders, ...otherTables];
 }
 
 function fromStatusUpdate(update: OrderStatusChanged): OrderView {

@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { decodeOrderStatusPayload, resolveMqttUrl } from '$lib/mqtt-client';
+import {
+	decodeOrderStatusPayload,
+	decodeTableSnapshotPayload,
+	resolveMqttUrl
+} from '$lib/mqtt-client';
 
 const encoder = new TextEncoder();
 
@@ -57,5 +61,54 @@ describe('MQTT browser boundary', () => {
 		)
 	])('rejects an invalid status payload without throwing', (payload) => {
 		expect(decodeOrderStatusPayload(payload)).toBeUndefined();
+	});
+
+	it('decodes a table snapshot only when topic and payload tables agree', () => {
+		const snapshot = {
+			schemaVersion: 1,
+			serviceInstanceId: '1058bf2e-0ef0-4ae6-a3bc-267f1abbbd54',
+			tableId: 2,
+			revision: 3,
+			generatedAt: '2026-07-29T18:00:04Z',
+			orders: [
+				{
+					schemaVersion: 1,
+					orderId: '3b11d31c-7d34-4dda-91e5-d64721a50463',
+					tableId: 2,
+					foodName: 'Chicken sandwich',
+					status: 'food_ready',
+					occurredAt: '2026-07-29T18:00:03Z',
+					readyAt: '2026-07-29T18:00:03Z'
+				}
+			]
+		};
+		const payload = encoder.encode(JSON.stringify(snapshot));
+
+		expect(decodeTableSnapshotPayload('restaurant/v1/table/2/snapshot', payload)).toEqual(snapshot);
+		expect(decodeTableSnapshotPayload('restaurant/v1/table/3/snapshot', payload)).toBeUndefined();
+	});
+
+	it('rejects a snapshot containing an order from another table', () => {
+		const payload = encoder.encode(
+			JSON.stringify({
+				schemaVersion: 1,
+				serviceInstanceId: '1058bf2e-0ef0-4ae6-a3bc-267f1abbbd54',
+				tableId: 2,
+				revision: 1,
+				generatedAt: '2026-07-29T18:00:04Z',
+				orders: [
+					{
+						schemaVersion: 1,
+						orderId: '3b11d31c-7d34-4dda-91e5-d64721a50463',
+						tableId: 3,
+						foodName: 'Wrong table soup',
+						status: 'queued',
+						occurredAt: '2026-07-29T18:00:03Z'
+					}
+				]
+			})
+		);
+
+		expect(decodeTableSnapshotPayload('restaurant/v1/table/2/snapshot', payload)).toBeUndefined();
 	});
 });

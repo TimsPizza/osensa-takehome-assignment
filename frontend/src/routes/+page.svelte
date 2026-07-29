@@ -3,7 +3,7 @@
 	import RadioIcon from '@lucide/svelte/icons/radio';
 	import UtensilsIcon from '@lucide/svelte/icons/utensils';
 	import { onMount } from 'svelte';
-	import { SvelteSet } from 'svelte/reactivity';
+	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 	import TableCard from '$lib/components/table-card.svelte';
 	import { Badge } from '$lib/components/ui/badge';
@@ -17,7 +17,10 @@
 		addSendingOrder,
 		applyOrderStatus,
 		markSendFailed,
+		replaceTableFromSnapshot,
+		shouldApplyTableSnapshot,
 		type OrderView,
+		type TableSnapshotCursor,
 		type TableId
 	} from '$lib/order-state';
 	import { createRandomOrders } from '$lib/random-orders';
@@ -33,6 +36,7 @@
 	let formError = $state('');
 	let submitting = $state(false);
 	const bulkOrderingTables = new SvelteSet<TableId>();
+	const snapshotCursors = new SvelteMap<TableId, TableSnapshotCursor>();
 	let mqttClient: RestaurantMqttClient | undefined;
 
 	const connected = $derived(connectionState === 'connected');
@@ -60,6 +64,17 @@
 			},
 			onOrderStatus: (status) => {
 				orders = applyOrderStatus(orders, status);
+			},
+			onTableSnapshot: (snapshot) => {
+				const tableId = snapshot.tableId as TableId;
+				if (!shouldApplyTableSnapshot(snapshot, snapshotCursors.get(tableId))) {
+					return;
+				}
+				orders = replaceTableFromSnapshot(orders, snapshot);
+				snapshotCursors.set(tableId, {
+					serviceInstanceId: snapshot.serviceInstanceId,
+					revision: snapshot.revision
+				});
 			},
 			onError: (message) => {
 				connectionError = message;
