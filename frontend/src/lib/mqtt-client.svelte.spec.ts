@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { get } from 'svelte/store';
 
+import { BoundaryTestController } from '$lib/boundary-test-controller';
 import type { KitchenPressureSnapshot, OrderStatusChanged } from '$lib/generated/contracts';
 import { RestaurantMqttClient } from '$lib/mqtt-client';
 import { createRandomOrders } from '$lib/random-orders';
@@ -115,6 +117,69 @@ describe.skipIf(!runIntegration)('frontend MQTT integration', () => {
 		});
 		expect(pressure?.workers).toHaveLength(8);
 	}, 10_000);
+
+	it('collapses three rapid publishes with the same UUID into one lifecycle', async () => {
+		let resolveConnected: (() => void) | undefined;
+		let resolvePassed: (() => void) | undefined;
+		let rejectFlow: ((error: Error) => void) | undefined;
+		const connection: { client?: RestaurantMqttClient } = {};
+
+		const connected = new Promise<void>((resolve) => {
+			resolveConnected = resolve;
+		});
+		const passed = new Promise<void>((resolve) => {
+			resolvePassed = resolve;
+		});
+		const flowFailure = new Promise<never>((_resolve, reject) => {
+			rejectFlow = reject;
+		});
+		const controller = new BoundaryTestController((order) => {
+			if (!connection.client) throw new Error('MQTT client is not ready');
+			return connection.client.publishOrder(order);
+		});
+		const unsubscribe = controller.idempotency.subscribe((run) => {
+			if (run.status === 'passed') resolvePassed?.();
+			if (run.status === 'failed') rejectFlow?.(new Error(run.error ?? 'Idempotency test failed'));
+		});
+
+		const client = new RestaurantMqttClient(
+			import.meta.env.VITE_MQTT_URL ?? 'ws://localhost:9001/mqtt',
+			{
+				onConnectionChange: (state) => {
+					if (state === 'connected') resolveConnected?.();
+				},
+				onOrderStatus: (status) => controller.handleOrderStatus(status),
+				onTableSnapshot: () => {},
+				onKitchenPressure: (snapshot) => controller.handlePressure(snapshot),
+				onError: (message) => rejectFlow?.(new Error(message))
+			}
+		);
+		connection.client = client;
+
+		try {
+			client.connect();
+			await withTimeout(
+				Promise.race([connected, flowFailure]),
+				5_000,
+				'frontend MQTT connection timed out'
+			);
+			await controller.runIdempotency();
+			await withTimeout(
+				Promise.race([passed, flowFailure]),
+				10_000,
+				'duplicate order lifecycle timed out'
+			);
+			expect(get(controller.idempotency)).toMatchObject({
+				status: 'passed',
+				published: 3,
+				uniqueStatuses: ['queued', 'processing', 'food_ready']
+			});
+		} finally {
+			unsubscribe();
+			controller.destroy();
+			await client.disconnect();
+		}
+	}, 15_000);
 
 	it('publishes ten random orders concurrently and receives every terminal state', async () => {
 		const batch = createRandomOrders(2);
