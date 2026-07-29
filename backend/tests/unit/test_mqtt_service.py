@@ -11,6 +11,7 @@ from uuid import UUID
 from app.config import Settings
 from app.models import FoodReady, OrderFailed, OrderRequested, OrderStatusUpdate
 from app.mqtt_service import MqttOrderService
+from app.order_registry import OrderRegistry
 from app.order_state import (
     FoodPrepared,
     OrderStatus,
@@ -20,11 +21,11 @@ from app.order_state import (
 from app.protocol import (
     KITCHEN_PRESSURE_TOPIC,
     MQTT_QOS,
-    ORDER_REQUESTED_TOPIC,
-    ORDER_STATUS_CHANGED_TOPIC,
     decode_kitchen_pressure,
     decode_order_status_changed,
     decode_table_snapshot,
+    order_requested_topic,
+    order_status_changed_topic,
     table_snapshot_topic,
 )
 
@@ -48,15 +49,21 @@ def make_settings() -> Settings:
     )
 
 
-def make_message(order_id: UUID, table_id: int) -> SimpleNamespace:
+def make_message(
+    order_id: UUID,
+    table_id: int,
+    *,
+    topic_table_id: int | None = None,
+    food_name: str | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
-        topic=ORDER_REQUESTED_TOPIC,
+        topic=order_requested_topic(topic_table_id or table_id),
         payload=json.dumps(
             {
                 "schemaVersion": 1,
                 "orderId": str(order_id),
                 "tableId": table_id,
-                "foodName": f"Food for table {table_id}",
+                "foodName": food_name or f"Food for table {table_id}",
             }
         ).encode(),
     )
@@ -189,7 +196,7 @@ async def test_orders_wait_queued_until_a_worker_is_available() -> None:
         await asyncio.wait_for(processor.all_started.wait(), timeout=1)
 
         await service._handle_message(make_message(THIRD_ORDER_ID, 3))
-        third_order = service._registry.get(THIRD_ORDER_ID)
+        third_order = service._registry.get(3, THIRD_ORDER_ID)
 
         assert processor.max_active == 2
         assert third_order is not None
@@ -199,8 +206,12 @@ async def test_orders_wait_queued_until_a_worker_is_available() -> None:
         processor.release.set()
         await asyncio.wait_for(service._processing_queue.join(), timeout=1)
         ready_orders = tuple(
-            service._registry.get(order_id)
-            for order_id in (FIRST_ORDER_ID, SECOND_ORDER_ID, THIRD_ORDER_ID)
+            service._registry.get(table_id, order_id)
+            for table_id, order_id in (
+                (1, FIRST_ORDER_ID),
+                (2, SECOND_ORDER_ID),
+                (3, THIRD_ORDER_ID),
+            )
         )
 
         assert processor.max_active == 2
@@ -232,7 +243,7 @@ async def test_duplicate_processing_order_is_not_processed_twice() -> None:
 
         processor.release.set()
         await asyncio.wait_for(service._processing_queue.join(), timeout=1)
-        ready_order = service._registry.get(FIRST_ORDER_ID)
+        ready_order = service._registry.get(1, FIRST_ORDER_ID)
 
         assert ready_order is not None
         assert ready_order.status is OrderStatus.FOOD_READY
@@ -251,17 +262,27 @@ async def test_conflicting_payload_does_not_start_another_processor() -> None:
     async with running_workers(service, count=2):
         await service._handle_message(make_message(FIRST_ORDER_ID, 1))
         await asyncio.wait_for(processor.all_started.wait(), timeout=1)
-        await service._handle_message(make_message(FIRST_ORDER_ID, 3))
+        await service._handle_message(make_message(FIRST_ORDER_ID, 1, food_name="Conflicting food"))
 
         assert processor.calls == 1
 
         processor.release.set()
         await asyncio.wait_for(service._processing_queue.join(), timeout=1)
-        ready_order = service._registry.get(FIRST_ORDER_ID)
+        ready_order = service._registry.get(1, FIRST_ORDER_ID)
 
         assert ready_order is not None
         assert ready_order.order.table_id == 1
         assert processor.calls == 1
+
+
+async def test_topic_table_cannot_submit_an_order_for_another_table() -> None:
+    service = MqttOrderService(make_settings())
+
+    await service._handle_message(make_message(FIRST_ORDER_ID, 4, topic_table_id=1))
+
+    assert len(service._registry) == 0
+    assert service._processing_queue.empty()
+    assert service._status_updates.empty()
 
 
 async def test_duplicate_published_order_requeues_cached_food_without_processing() -> None:
@@ -279,9 +300,9 @@ async def test_duplicate_published_order_requeues_cached_food_without_processing
         readyAt=READY_AT,
     )
     service._registry.register(order)
-    service._registry.apply(order.order_id, ProcessingStarted())
-    service._registry.apply(order.order_id, FoodPrepared(food))
-    service._registry.apply(order.order_id, PublishConfirmed())
+    service._registry.apply(order.table_id, order.order_id, ProcessingStarted())
+    service._registry.apply(order.table_id, order.order_id, FoodPrepared(food))
+    service._registry.apply(order.table_id, order.order_id, PublishConfirmed())
 
     await service._handle_message(message)
 
@@ -307,8 +328,8 @@ async def test_full_queue_fails_new_order_without_leaving_it_queued() -> None:
         await service._handle_message(make_message(SECOND_ORDER_ID, 2))
         await service._handle_message(make_message(THIRD_ORDER_ID, 3))
 
-        queued_order = service._registry.get(SECOND_ORDER_ID)
-        rejected_order = service._registry.get(THIRD_ORDER_ID)
+        queued_order = service._registry.get(2, SECOND_ORDER_ID)
+        rejected_order = service._registry.get(3, THIRD_ORDER_ID)
 
         assert queued_order is not None
         assert queued_order.status is OrderStatus.QUEUED
@@ -321,7 +342,8 @@ async def test_full_queue_fails_new_order_without_leaving_it_queued() -> None:
         await asyncio.wait_for(service._processing_queue.join(), timeout=1)
         updates = drain_status_updates(service)
         ready_orders = tuple(
-            service._registry.get(order_id) for order_id in (FIRST_ORDER_ID, SECOND_ORDER_ID)
+            service._registry.get(table_id, order_id)
+            for table_id, order_id in ((1, FIRST_ORDER_ID), (2, SECOND_ORDER_ID))
         )
         failed_update = next(
             update
@@ -337,6 +359,30 @@ async def test_full_queue_fails_new_order_without_leaving_it_queued() -> None:
         assert failed_update.retryable is True
         assert "processing queue is full" not in failed_update.message
         assert processor.calls == 2
+
+
+async def test_full_registry_rejects_new_work_without_evicting_an_active_order() -> None:
+    service = MqttOrderService(
+        make_settings(),
+        registry=OrderRegistry(max_orders=1),
+        max_concurrent_orders=1,
+        max_queued_orders=2,
+    )
+
+    await service._handle_message(make_message(FIRST_ORDER_ID, 1))
+    await service._handle_message(make_message(SECOND_ORDER_ID, 2))
+
+    updates = drain_status_updates(service)
+    rejected = next(
+        update
+        for update in updates
+        if update.order_id == SECOND_ORDER_ID and isinstance(update, OrderFailed)
+    )
+    assert rejected.code == "service_overloaded"
+    assert rejected.retryable is True
+    assert service._registry.get(1, FIRST_ORDER_ID) is not None
+    assert service._registry.get(2, SECOND_ORDER_ID) is None
+    assert service._processing_queue.qsize() == 1
 
 
 async def test_processing_failure_does_not_stop_worker_from_consuming() -> None:
@@ -355,8 +401,8 @@ async def test_processing_failure_does_not_stop_worker_from_consuming() -> None:
         await asyncio.wait_for(service._processing_queue.join(), timeout=1)
         updates = drain_status_updates(service)
 
-        failed_order = service._registry.get(FIRST_ORDER_ID)
-        ready_order = service._registry.get(SECOND_ORDER_ID)
+        failed_order = service._registry.get(1, FIRST_ORDER_ID)
+        ready_order = service._registry.get(2, SECOND_ORDER_ID)
         failed_update = next(
             update
             for update in updates
@@ -402,7 +448,10 @@ async def test_default_worker_pool_handles_a_saturated_burst_without_loss() -> N
                 make_message(order_id, table_id=(index % 4) + 1),
             )
 
-        saturated_states = tuple(service._registry.get(order_id) for order_id in order_ids)
+        saturated_states = tuple(
+            service._registry.get((index % 4) + 1, order_id)
+            for index, order_id in enumerate(order_ids)
+        )
         saturated_counts = Counter(state.status for state in saturated_states if state is not None)
 
         assert all(state is not None for state in saturated_states)
@@ -418,7 +467,10 @@ async def test_default_worker_pool_handles_a_saturated_burst_without_loss() -> N
         await asyncio.wait_for(service._processing_queue.join(), timeout=5)
 
         updates = drain_status_updates(service)
-        final_states = tuple(service._registry.get(order_id) for order_id in order_ids)
+        final_states = tuple(
+            service._registry.get((index % 4) + 1, order_id)
+            for index, order_id in enumerate(order_ids)
+        )
         final_counts = Counter(state.status for state in final_states if state is not None)
         ready_order_ids = {update.order_id for update in updates if isinstance(update, FoodReady)}
         update_counts = Counter(update.status for update in updates)
@@ -454,7 +506,7 @@ async def test_publisher_emits_ordered_status_union_and_confirms_ready_food() ->
         await service._handle_message(make_message(FIRST_ORDER_ID, 1))
         await asyncio.wait_for(service._processing_queue.join(), timeout=1)
 
-    ready_order = service._registry.get(FIRST_ORDER_ID)
+    ready_order = service._registry.get(1, FIRST_ORDER_ID)
     assert ready_order is not None
     assert ready_order.status is OrderStatus.FOOD_READY
 
@@ -467,20 +519,18 @@ async def test_publisher_emits_ordered_status_union_and_confirms_ready_food() ->
         await asyncio.gather(publisher, return_exceptions=True)
 
     status_messages = [
-        message for message in client.published if message[0] == ORDER_STATUS_CHANGED_TOPIC
+        message for message in client.published if message[0] == order_status_changed_topic(1)
     ]
     snapshot_messages = [
         message for message in client.published if message[0] == table_snapshot_topic(1)
     ]
     updates = [
-        decode_order_status_changed(payload)
-        for _topic, payload, _qos, _retain in status_messages
+        decode_order_status_changed(payload) for _topic, payload, _qos, _retain in status_messages
     ]
     snapshots = [
-        decode_table_snapshot(payload)
-        for _topic, payload, _qos, _retain in snapshot_messages
+        decode_table_snapshot(payload) for _topic, payload, _qos, _retain in snapshot_messages
     ]
-    published_order = service._registry.get(FIRST_ORDER_ID)
+    published_order = service._registry.get(1, FIRST_ORDER_ID)
 
     assert [update.status for update in updates] == [
         "queued",
@@ -488,7 +538,7 @@ async def test_publisher_emits_ordered_status_union_and_confirms_ready_food() ->
         "food_ready",
     ]
     assert all(
-        topic == ORDER_STATUS_CHANGED_TOPIC and qos == MQTT_QOS and retain is False
+        topic == order_status_changed_topic(1) and qos == MQTT_QOS and retain is False
         for topic, _payload, qos, retain in status_messages
     )
     assert [snapshot.revision for snapshot in snapshots] == [1, 2, 3]
@@ -514,15 +564,12 @@ async def test_service_initializes_retained_table_and_pressure_snapshots() -> No
     await service._initialize_retained_snapshots(client)  # type: ignore[arg-type]
 
     snapshots = [
-        decode_table_snapshot(payload)
-        for _topic, payload, _qos, _retain in client.published[:4]
+        decode_table_snapshot(payload) for _topic, payload, _qos, _retain in client.published[:4]
     ]
     assert [snapshot.table_id for snapshot in snapshots] == [1, 2, 3, 4]
     assert all(snapshot.revision == 0 and snapshot.orders == () for snapshot in snapshots)
     assert all(
-        topic == table_snapshot_topic(snapshot.table_id)
-        and qos == MQTT_QOS
-        and retain is True
+        topic == table_snapshot_topic(snapshot.table_id) and qos == MQTT_QOS and retain is True
         for snapshot, (topic, _payload, qos, retain) in zip(
             snapshots,
             client.published[:4],

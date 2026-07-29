@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 
 def _required_port(name: str, default: int) -> int:
@@ -34,6 +35,23 @@ def _positive_float(name: str, default: float) -> float:
     return value
 
 
+def _optional_secret(name: str) -> str | None:
+    value = os.getenv(name)
+    file_path = os.getenv(f"{name}_FILE")
+    if value is not None and file_path is not None:
+        raise ValueError(f"{name} and {name}_FILE cannot both be set")
+    if file_path is None:
+        return value or None
+
+    try:
+        secret = Path(file_path).read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise ValueError(f"{name}_FILE could not be read") from error
+    if not secret:
+        raise ValueError(f"{name}_FILE must not be empty")
+    return secret
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     mqtt_host: str
@@ -47,6 +65,8 @@ class Settings:
     log_level: str
     order_worker_count: int = 8
     order_queue_capacity: int = 256
+    order_registry_capacity: int = 4096
+    mqtt_incoming_queue_capacity: int = 1024
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -54,9 +74,33 @@ class Settings:
         websocket_path = os.getenv("MQTT_WEBSOCKET_PATH", "/mqtt").strip()
         client_id = os.getenv("MQTT_CLIENT_ID", "osensa-order-service").strip()
         username = os.getenv("MQTT_USERNAME") or None
-        password = os.getenv("MQTT_PASSWORD") or None
+        password = _optional_secret("MQTT_PASSWORD")
         reconnect_delay = _positive_float("MQTT_RECONNECT_DELAY_SECONDS", 1.0)
         reconnect_max_delay = _positive_float("MQTT_RECONNECT_MAX_DELAY_SECONDS", 30.0)
+        worker_count = _bounded_int(
+            "ORDER_WORKER_COUNT",
+            8,
+            minimum=1,
+            maximum=64,
+        )
+        queue_capacity = _bounded_int(
+            "ORDER_QUEUE_CAPACITY",
+            256,
+            minimum=1,
+            maximum=10_000,
+        )
+        registry_capacity = _bounded_int(
+            "ORDER_REGISTRY_CAPACITY",
+            4096,
+            minimum=1,
+            maximum=100_000,
+        )
+        incoming_queue_capacity = _bounded_int(
+            "MQTT_INCOMING_QUEUE_CAPACITY",
+            1024,
+            minimum=1,
+            maximum=100_000,
+        )
 
         if not host:
             raise ValueError("MQTT_HOST must not be empty")
@@ -70,6 +114,10 @@ class Settings:
             raise ValueError(
                 "MQTT_RECONNECT_DELAY_SECONDS must not exceed MQTT_RECONNECT_MAX_DELAY_SECONDS"
             )
+        if registry_capacity < worker_count + queue_capacity:
+            raise ValueError(
+                "ORDER_REGISTRY_CAPACITY must be at least ORDER_WORKER_COUNT + ORDER_QUEUE_CAPACITY"
+            )
 
         return cls(
             mqtt_host=host,
@@ -81,16 +129,8 @@ class Settings:
             reconnect_delay_seconds=reconnect_delay,
             reconnect_max_delay_seconds=reconnect_max_delay,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
-            order_worker_count=_bounded_int(
-                "ORDER_WORKER_COUNT",
-                8,
-                minimum=1,
-                maximum=64,
-            ),
-            order_queue_capacity=_bounded_int(
-                "ORDER_QUEUE_CAPACITY",
-                256,
-                minimum=1,
-                maximum=10_000,
-            ),
+            order_worker_count=worker_count,
+            order_queue_capacity=queue_capacity,
+            order_registry_capacity=registry_capacity,
+            mqtt_incoming_queue_capacity=incoming_queue_capacity,
         )

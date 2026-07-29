@@ -20,11 +20,12 @@ from app.models import (
 from app.protocol import (
     KITCHEN_PRESSURE_TOPIC,
     MQTT_QOS,
-    ORDER_REQUESTED_TOPIC,
-    ORDER_STATUS_CHANGED_TOPIC,
+    ORDER_STATUS_CHANGED_TOPIC_FILTER,
     decode_kitchen_pressure,
     decode_order_status_changed,
     decode_table_snapshot,
+    order_requested_topic,
+    table_id_from_order_status_changed_topic,
     table_snapshot_topic,
 )
 
@@ -95,7 +96,7 @@ async def connected_client(
         websocket_path=websocket_path,
         max_concurrent_outgoing_calls=max_outgoing_calls,
     ) as client:
-        await client.subscribe(ORDER_STATUS_CHANGED_TOPIC, qos=MQTT_QOS)
+        await client.subscribe(ORDER_STATUS_CHANGED_TOPIC_FILTER, qos=MQTT_QOS)
         await client.subscribe(SUBSCRIPTION_COUNT_TOPIC, qos=0)
         await wait_until_backend_is_subscribed(client)
         yield client
@@ -137,9 +138,14 @@ async def pressure_client() -> AsyncIterator[aiomqtt.Client]:
         yield client
 
 
-async def publish_payload(client: aiomqtt.Client, payload: bytes) -> None:
+async def publish_payload(
+    client: aiomqtt.Client,
+    payload: bytes,
+    *,
+    table_id: int = 1,
+) -> None:
     await client.publish(
-        ORDER_REQUESTED_TOPIC,
+        order_requested_topic(table_id),
         payload=payload,
         qos=MQTT_QOS,
         retain=False,
@@ -157,7 +163,7 @@ async def wait_for_food(
     statuses = {order_id: [] for order_id in expected_order_ids}
 
     async for message in client.messages:
-        if str(message.topic) != ORDER_STATUS_CHANGED_TOPIC:
+        if table_id_from_order_status_changed_topic(str(message.topic)) is None:
             continue
         update = decode_order_status_changed(message.payload)
         order_id = str(update.order_id)
@@ -182,7 +188,7 @@ async def wait_for_one_food(
     statuses: list[str] = []
 
     async for message in client.messages:
-        if str(message.topic) != ORDER_STATUS_CHANGED_TOPIC:
+        if table_id_from_order_status_changed_topic(str(message.topic)) is None:
             continue
         update = decode_order_status_changed(message.payload)
         if str(update.order_id) != order_id:
@@ -218,9 +224,7 @@ async def wait_for_pressure_cycle(
         if str(message.topic) != KITCHEN_PRESSURE_TOPIC:
             continue
         pressure = decode_kitchen_pressure(message.payload)
-        busy_workers = sum(
-            worker.status == "processing" for worker in pressure.workers
-        )
+        busy_workers = sum(worker.status == "processing" for worker in pressure.workers)
         if busy_workers == len(pressure.workers) and pressure.queued_orders > 0:
             peak = pressure
         if peak is not None and busy_workers == 0 and pressure.queued_orders == 0:
@@ -262,7 +266,11 @@ async def test_concurrent_orders_round_trip_over_websockets() -> None:
                         food_name=expected_food.food_name,
                     )
                 )
-                await publish_payload(client, order.model_dump_json().encode())
+                await publish_payload(
+                    client,
+                    order.model_dump_json().encode(),
+                    table_id=expected_food.table_id,
+                )
 
             received, statuses = await wait_for_food(client, set(expected))
 
@@ -291,6 +299,7 @@ async def test_new_client_recovers_food_completed_while_ordering_client_was_clos
                         table_id=table_id,
                         food_name="Offline recovery soup",
                     ),
+                    table_id=table_id,
                 )
 
             food, statuses = await wait_for_one_food(completion_observer, order_id)
@@ -298,9 +307,7 @@ async def test_new_client_recovers_food_completed_while_ordering_client_was_clos
         async with snapshot_client(table_id) as new_client:
             snapshot, message = await wait_for_retained_snapshot(new_client, table_id)
 
-    recovered = next(
-        update for update in snapshot.orders if str(update.order_id) == order_id
-    )
+    recovered = next(update for update in snapshot.orders if str(update.order_id) == order_id)
     assert statuses == ["queued", "processing", "food_ready"]
     assert food.food_name == "Offline recovery soup"
     assert isinstance(recovered, FoodReady)
@@ -311,10 +318,13 @@ async def test_new_client_recovers_food_completed_while_ordering_client_was_clos
 
 async def test_pressure_snapshot_exposes_bounded_queue_and_worker_pool() -> None:
     orders = [
-        order_payload(
-            order_id=str(uuid4()),
-            table_id=(index % 4) + 1,
-            food_name=f"Pressure order {index:02d}",
+        (
+            (index % 4) + 1,
+            order_payload(
+                order_id=str(uuid4()),
+                table_id=(index % 4) + 1,
+                food_name=f"Pressure order {index:02d}",
+            ),
         )
         for index in range(20)
     ]
@@ -323,7 +333,10 @@ async def test_pressure_snapshot_exposes_bounded_queue_and_worker_pool() -> None
         async with pressure_client() as monitor:
             async with connected_client(max_outgoing_calls=32) as producer:
                 await asyncio.gather(
-                    *(publish_payload(producer, payload) for payload in orders)
+                    *(
+                        publish_payload(producer, payload, table_id=table_id)
+                        for table_id, payload in orders
+                    )
                 )
                 peak, idle = await wait_for_pressure_cycle(monitor)
 
@@ -382,12 +395,13 @@ async def test_malformed_and_invalid_orders_are_rejected_without_poisoning_flow(
                     table_id=4,
                     food_name="Sentinel soup",
                 ),
+                table_id=4,
             )
 
             invalid_updates = []
             sentinel_statuses = []
             async for message in client.messages:
-                if str(message.topic) != ORDER_STATUS_CHANGED_TOPIC:
+                if table_id_from_order_status_changed_topic(str(message.topic)) is None:
                     continue
                 update = decode_order_status_changed(message.payload)
                 update_order_id = str(update.order_id)
@@ -409,10 +423,10 @@ async def test_duplicate_order_is_processed_once_then_republished_from_cache() -
 
     async with asyncio.timeout(20):
         async with connected_client(max_outgoing_calls=32) as client:
-            await asyncio.gather(*(publish_payload(client, payload) for _ in range(20)))
+            await asyncio.gather(*(publish_payload(client, payload, table_id=2) for _ in range(20)))
             first_food, first_statuses = await wait_for_one_food(client, order_id)
 
-            await publish_payload(client, payload)
+            await publish_payload(client, payload, table_id=2)
             republished_food, republished_statuses = await wait_for_one_food(client, order_id)
 
     assert first_statuses == ["queued", "processing", "food_ready"]
@@ -424,16 +438,16 @@ async def test_duplicate_order_is_processed_once_then_republished_from_cache() -
 async def test_conflicting_payload_never_mutates_the_original_order() -> None:
     order_id = str(uuid4())
     original = order_payload(order_id=order_id, table_id=1, food_name="Original soup")
-    conflicting = order_payload(order_id=order_id, table_id=4, food_name="Conflicting tacos")
+    conflicting = order_payload(order_id=order_id, table_id=1, food_name="Conflicting tacos")
     sentinel_id = str(uuid4())
 
     async with asyncio.timeout(25):
         async with connected_client() as client:
-            await publish_payload(client, original)
-            await publish_payload(client, conflicting)
+            await publish_payload(client, original, table_id=1)
+            await publish_payload(client, conflicting, table_id=1)
             food, statuses = await wait_for_one_food(client, order_id)
 
-            await publish_payload(client, conflicting)
+            await publish_payload(client, conflicting, table_id=1)
             await publish_payload(
                 client,
                 order_payload(
@@ -441,12 +455,13 @@ async def test_conflicting_payload_never_mutates_the_original_order() -> None:
                     table_id=3,
                     food_name="Conflict sentinel",
                 ),
+                table_id=3,
             )
 
             unexpected_original_updates = []
             sentinel_statuses = []
             async for message in client.messages:
-                if str(message.topic) != ORDER_STATUS_CHANGED_TOPIC:
+                if table_id_from_order_status_changed_topic(str(message.topic)) is None:
                     continue
                 update = decode_order_status_changed(message.payload)
                 update_order_id = str(update.order_id)
@@ -487,6 +502,7 @@ async def test_hundred_order_burst_reaches_unique_terminal_states() -> None:
                             table_id=food.table_id,
                             food_name=food.food_name,
                         ),
+                        table_id=food.table_id,
                     )
                     for order_id, food in expected.items()
                 )
@@ -527,6 +543,7 @@ async def test_saturated_burst_reports_explicit_admission_failures() -> None:
                                     table_id=(index % 4) + 1,
                                     food_name=f"Saturation order {index:03d}",
                                 ),
+                                table_id=(index % 4) + 1,
                             )
                             for index, order_id in enumerate(order_ids)
                         )
@@ -535,7 +552,7 @@ async def test_saturated_burst_reports_explicit_admission_failures() -> None:
                     admissions: dict[str, str] = {}
                     failures: dict[str, OrderFailed] = {}
                     async for message in client.messages:
-                        if str(message.topic) != ORDER_STATUS_CHANGED_TOPIC:
+                        if table_id_from_order_status_changed_topic(str(message.topic)) is None:
                             continue
                         update = decode_order_status_changed(message.payload)
                         update_order_id = str(update.order_id)

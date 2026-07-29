@@ -7,6 +7,8 @@ from pydantic import ValidationError
 
 from app.models import FoodReady, KitchenPressureSnapshot, OrderFailed, TableSnapshot
 from app.protocol import (
+    ORDER_REQUESTED_TOPIC_FILTER,
+    ORDER_STATUS_CHANGED_TOPIC_FILTER,
     decode_kitchen_pressure,
     decode_order_requested,
     decode_order_status_changed,
@@ -14,6 +16,10 @@ from app.protocol import (
     encode_kitchen_pressure,
     encode_order_status_changed,
     encode_table_snapshot,
+    order_requested_topic,
+    order_status_changed_topic,
+    table_id_from_order_requested_topic,
+    table_id_from_order_status_changed_topic,
     table_snapshot_topic,
 )
 
@@ -110,10 +116,47 @@ def test_table_snapshot_round_trips_and_uses_a_table_scoped_topic() -> None:
     assert table_snapshot_topic(decoded.table_id) == "restaurant/v1/table/2/snapshot"
 
 
+def test_order_topics_are_table_scoped_and_match_the_backend_filters() -> None:
+    assert order_requested_topic(2) == "restaurant/v1/table/2/order/requested"
+    assert order_status_changed_topic(2) == "restaurant/v1/table/2/order/status-changed"
+    assert ORDER_REQUESTED_TOPIC_FILTER == "restaurant/v1/table/+/order/requested"
+    assert ORDER_STATUS_CHANGED_TOPIC_FILTER == "restaurant/v1/table/+/order/status-changed"
+
+
+@pytest.mark.parametrize(
+    ("topic", "expected"),
+    [
+        ("restaurant/v1/table/1/order/requested", 1),
+        ("restaurant/v1/table/4/order/requested", 4),
+        ("restaurant/v1/table/0/order/requested", None),
+        ("restaurant/v1/table/5/order/requested", None),
+        ("restaurant/v1/table/not-a-table/order/requested", None),
+        ("restaurant/v1/table/1/order/status-changed", None),
+        ("restaurant/v1/order/requested", None),
+    ],
+)
+def test_request_topic_parser_rejects_topics_outside_the_table_boundary(
+    topic: str,
+    expected: int | None,
+) -> None:
+    assert table_id_from_order_requested_topic(topic) == expected
+
+
+def test_status_topic_parser_validates_the_table_boundary() -> None:
+    assert (
+        table_id_from_order_status_changed_topic("restaurant/v1/table/3/order/status-changed") == 3
+    )
+    assert table_id_from_order_status_changed_topic("restaurant/v1/table/3/order/requested") is None
+
+
 @pytest.mark.parametrize("table_id", [0, 5])
-def test_table_snapshot_topic_rejects_an_unknown_table(table_id: int) -> None:
+def test_table_scoped_topics_reject_an_unknown_table(table_id: int) -> None:
     with pytest.raises(ValueError):
         table_snapshot_topic(table_id)
+    with pytest.raises(ValueError):
+        order_requested_topic(table_id)
+    with pytest.raises(ValueError):
+        order_status_changed_topic(table_id)
 
 
 def test_kitchen_pressure_round_trips() -> None:

@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from typing import Protocol
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import aiomqtt
 from pydantic import ValidationError
@@ -18,7 +18,12 @@ from app.models import (
     OrderStatusUpdate,
 )
 from app.order_processor import Clock, OrderProcessor, utc_now
-from app.order_registry import OrderRegistry, RegistrationAction
+from app.order_registry import (
+    OrderKey,
+    OrderRegistry,
+    OrderRegistryFullError,
+    RegistrationAction,
+)
 from app.order_state import (
     FoodPrepared,
     OrderState,
@@ -30,12 +35,13 @@ from app.order_state import (
 from app.protocol import (
     KITCHEN_PRESSURE_TOPIC,
     MQTT_QOS,
-    ORDER_REQUESTED_TOPIC,
-    ORDER_STATUS_CHANGED_TOPIC,
+    ORDER_REQUESTED_TOPIC_FILTER,
     decode_order_requested,
     encode_kitchen_pressure,
     encode_order_status_changed,
     encode_table_snapshot,
+    order_status_changed_topic,
+    table_id_from_order_requested_topic,
     table_snapshot_topic,
 )
 from app.table_projection import TableSnapshotProjection
@@ -61,14 +67,10 @@ class MqttOrderService:
         clock: Clock = utc_now,
     ) -> None:
         worker_count = (
-            settings.order_worker_count
-            if max_concurrent_orders is None
-            else max_concurrent_orders
+            settings.order_worker_count if max_concurrent_orders is None else max_concurrent_orders
         )
         queue_capacity = (
-            settings.order_queue_capacity
-            if max_queued_orders is None
-            else max_queued_orders
+            settings.order_queue_capacity if max_queued_orders is None else max_queued_orders
         )
         if worker_count < 1 or worker_count > 64:
             raise ValueError("max_concurrent_orders must be between 1 and 64")
@@ -77,10 +79,14 @@ class MqttOrderService:
 
         self._settings = settings
         self._processor = processor if processor is not None else OrderProcessor()
-        self._registry = registry if registry is not None else OrderRegistry()
+        self._registry = (
+            registry
+            if registry is not None
+            else OrderRegistry(max_orders=settings.order_registry_capacity)
+        )
         self._clock = clock
         self._worker_count = worker_count
-        self._processing_queue: asyncio.Queue[UUID] = asyncio.Queue(
+        self._processing_queue: asyncio.Queue[OrderKey] = asyncio.Queue(
             maxsize=queue_capacity,
         )
         self._status_updates: asyncio.Queue[OrderStatusUpdate] = asyncio.Queue(
@@ -110,9 +116,9 @@ class MqttOrderService:
             clean_session=True,
             transport="websockets",
             websocket_path=self._settings.mqtt_websocket_path,
-            # A bounded aiomqtt queue silently discards overflow. Admission control
-            # belongs to _processing_queue, where callers receive an explicit failure.
-            max_queued_incoming_messages=0,
+            # Normal load reaches the explicit application admission boundary. This
+            # second, larger bound protects process memory under a hostile flood.
+            max_queued_incoming_messages=self._settings.mqtt_incoming_queue_capacity,
             max_concurrent_outgoing_calls=10,
         )
 
@@ -136,11 +142,11 @@ class MqttOrderService:
                 async with self._client() as client:
                     if not self._snapshots_initialized:
                         await self._initialize_retained_snapshots(client)
-                    await client.subscribe(ORDER_REQUESTED_TOPIC, qos=MQTT_QOS)
+                    await client.subscribe(ORDER_REQUESTED_TOPIC_FILTER, qos=MQTT_QOS)
                     reconnect_delay = self._settings.reconnect_delay_seconds
                     LOGGER.info(
                         "mqtt_subscribed topic=%s qos=%d transport=websockets",
-                        ORDER_REQUESTED_TOPIC,
+                        ORDER_REQUESTED_TOPIC_FILTER,
                         MQTT_QOS,
                     )
                     await self._run_connected(client)
@@ -185,8 +191,7 @@ class MqttOrderService:
             retain=True,
         )
         LOGGER.info(
-            "kitchen_pressure_initialized topic=%s revision=%d workers=%d "
-            "queue_capacity=%d",
+            "kitchen_pressure_initialized topic=%s revision=%d workers=%d queue_capacity=%d",
             KITCHEN_PRESSURE_TOPIC,
             pressure.revision,
             len(pressure.workers),
@@ -227,7 +232,9 @@ class MqttOrderService:
             await self._handle_message(message)
 
     async def _handle_message(self, message: aiomqtt.Message) -> None:
-        if str(message.topic) != ORDER_REQUESTED_TOPIC:
+        topic = str(message.topic)
+        topic_table_id = table_id_from_order_requested_topic(topic)
+        if topic_table_id is None:
             LOGGER.warning("mqtt_unexpected_topic topic=%s", message.topic)
             return
 
@@ -240,13 +247,45 @@ class MqttOrderService:
             )
             return
 
+        if order.table_id != topic_table_id:
+            LOGGER.warning(
+                "order_rejected reason=table_topic_mismatch topic=%s "
+                "topic_table_id=%d payload_table_id=%d order_id=%s",
+                topic,
+                topic_table_id,
+                order.table_id,
+                order.order_id,
+            )
+            return
+
         LOGGER.info(
             "order_received order_id=%s table_id=%d",
             order.order_id,
             order.table_id,
         )
 
-        registration = self._registry.register(order)
+        try:
+            registration = self._registry.register(order)
+        except OrderRegistryFullError:
+            self._queue_status_update(
+                OrderFailed(
+                    schemaVersion=1,
+                    orderId=order.order_id,
+                    tableId=order.table_id,
+                    foodName=order.food_name,
+                    status="failed",
+                    occurredAt=self._clock(),
+                    code="service_overloaded",
+                    message=SERVICE_OVERLOADED_MESSAGE,
+                    retryable=True,
+                )
+            )
+            LOGGER.warning(
+                "order_registry_admission_failed order_id=%s table_id=%d",
+                order.order_id,
+                order.table_id,
+            )
+            return
 
         if registration.action is RegistrationAction.IGNORE:
             LOGGER.info(
@@ -278,9 +317,10 @@ class MqttOrderService:
             return
 
         try:
-            self._processing_queue.put_nowait(order.order_id)
+            self._processing_queue.put_nowait((order.table_id, order.order_id))
         except asyncio.QueueFull:
             failed_order = self._registry.apply(
+                order.table_id,
                 order.order_id,
                 QueueAdmissionFailed("processing queue is full"),
             )
@@ -326,9 +366,10 @@ class MqttOrderService:
 
     async def _consume_orders(self, worker_number: int) -> None:
         while True:
-            order_id = await self._processing_queue.get()
+            table_id, order_id = await self._processing_queue.get()
             try:
                 processing_order = self._registry.apply(
+                    table_id,
                     order_id,
                     ProcessingStarted(),
                 )
@@ -372,6 +413,7 @@ class MqttOrderService:
         except Exception as error:
             failure_reason = f"{type(error).__name__}: {error}"
             failed_order = self._registry.apply(
+                order.table_id,
                 order.order_id,
                 ProcessingFailed(failure_reason),
             )
@@ -398,6 +440,7 @@ class MqttOrderService:
             return
 
         ready_order = self._registry.apply(
+            order.table_id,
             order.order_id,
             FoodPrepared(food),
         )
@@ -427,8 +470,9 @@ class MqttOrderService:
                 self._pending_update = await self._status_updates.get()
 
             update = self._pending_update
+            status_topic = order_status_changed_topic(update.table_id)
             await client.publish(
-                ORDER_STATUS_CHANGED_TOPIC,
+                status_topic,
                 payload=encode_order_status_changed(update),
                 qos=MQTT_QOS,
                 retain=False,
@@ -448,6 +492,7 @@ class MqttOrderService:
             internal_status = update.status
             if isinstance(update, FoodReady):
                 published_order = self._registry.apply(
+                    update.table_id,
                     update.order_id,
                     PublishConfirmed(),
                 )
@@ -459,7 +504,7 @@ class MqttOrderService:
                 "internal_status=%s",
                 update.order_id,
                 update.table_id,
-                ORDER_STATUS_CHANGED_TOPIC,
+                status_topic,
                 snapshot_topic,
                 snapshot.revision,
                 update.status,
@@ -486,8 +531,7 @@ class MqttOrderService:
                 retain=True,
             )
             LOGGER.info(
-                "kitchen_pressure_published topic=%s revision=%d queued_orders=%d "
-                "busy_workers=%d",
+                "kitchen_pressure_published topic=%s revision=%d queued_orders=%d busy_workers=%d",
                 KITCHEN_PRESSURE_TOPIC,
                 snapshot.revision,
                 snapshot.queued_orders,

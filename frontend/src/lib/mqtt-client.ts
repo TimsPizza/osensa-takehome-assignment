@@ -11,20 +11,32 @@ import {
 	type TableSnapshot
 } from '$lib/generated/contracts';
 
-const ORDER_REQUESTED_TOPIC = 'restaurant/v1/order/requested';
-const ORDER_STATUS_CHANGED_TOPIC = 'restaurant/v1/order/status-changed';
+const ORDER_STATUS_CHANGED_TOPIC_FILTER = 'restaurant/v1/table/+/order/status-changed';
+const ORDER_STATUS_CHANGED_TOPIC = /^restaurant\/v1\/table\/([1-4])\/order\/status-changed$/;
 const TABLE_SNAPSHOT_TOPIC_FILTER = 'restaurant/v1/table/+/snapshot';
 const TABLE_SNAPSHOT_TOPIC = /^restaurant\/v1\/table\/([1-4])\/snapshot$/;
 const KITCHEN_PRESSURE_TOPIC = 'restaurant/v1/kitchen/pressure';
 const SUBSCRIPTION_TOPICS = [
-	ORDER_STATUS_CHANGED_TOPIC,
+	ORDER_STATUS_CHANGED_TOPIC_FILTER,
 	TABLE_SNAPSHOT_TOPIC_FILTER,
 	KITCHEN_PRESSURE_TOPIC
 ];
 const MQTT_QOS = 1 as const;
 export const MQTT_URL_STORAGE_KEY = 'osensa.mqtt.websocket-url';
+export const MQTT_USERNAME_SESSION_KEY = 'osensa.mqtt.username';
+export const MQTT_PASSWORD_SESSION_KEY = 'osensa.mqtt.password';
 
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'offline';
+
+export interface BrokerCredentials {
+	username: string;
+	password: string;
+}
+
+export interface BrokerConnectionSettings {
+	url: string;
+	credentials?: BrokerCredentials;
+}
 
 export interface MqttClientCallbacks {
 	onConnectionChange: (state: ConnectionState) => void;
@@ -112,11 +124,82 @@ export function clearStoredMqttUrl(storage: BrowserStorage): void {
 	storage.removeItem(MQTT_URL_STORAGE_KEY);
 }
 
-export function decodeOrderStatusPayload(payload: Uint8Array): OrderStatusChanged | undefined {
+export function normalizeMqttCredentials(
+	usernameValue: string,
+	password: string
+): BrokerCredentials | undefined {
+	const username = usernameValue.trim();
+	if (!username && !password) {
+		return undefined;
+	}
+	if (!username || !password) {
+		throw new Error('Enter both the Broker username and password.');
+	}
+	if (username.length > 128) {
+		throw new Error('The Broker username must be 128 characters or fewer.');
+	}
+	if (password.length > 512) {
+		throw new Error('The Broker password must be 512 characters or fewer.');
+	}
+	return { username, password };
+}
+
+export function readSessionMqttCredentials(storage: BrowserStorage): BrokerCredentials | undefined {
+	try {
+		return normalizeMqttCredentials(
+			storage.getItem(MQTT_USERNAME_SESSION_KEY) ?? '',
+			storage.getItem(MQTT_PASSWORD_SESSION_KEY) ?? ''
+		);
+	} catch {
+		return undefined;
+	}
+}
+
+export function storeSessionMqttCredentials(
+	storage: BrowserStorage,
+	credentials: BrokerCredentials | undefined
+): void {
+	if (!credentials) {
+		clearSessionMqttCredentials(storage);
+		return;
+	}
+
+	const normalized = normalizeMqttCredentials(credentials.username, credentials.password);
+	if (!normalized) {
+		clearSessionMqttCredentials(storage);
+		return;
+	}
+	storage.setItem(MQTT_USERNAME_SESSION_KEY, normalized.username);
+	storage.setItem(MQTT_PASSWORD_SESSION_KEY, normalized.password);
+}
+
+export function clearSessionMqttCredentials(storage: BrowserStorage): void {
+	storage.removeItem(MQTT_USERNAME_SESSION_KEY);
+	storage.removeItem(MQTT_PASSWORD_SESSION_KEY);
+}
+
+export function orderRequestedTopic(tableId: number): string {
+	if (![1, 2, 3, 4].includes(tableId)) {
+		throw new Error('tableId must be between 1 and 4');
+	}
+	return `restaurant/v1/table/${tableId}/order/requested`;
+}
+
+export function decodeOrderStatusPayload(
+	topic: string,
+	payload: Uint8Array
+): OrderStatusChanged | undefined {
+	const topicMatch = ORDER_STATUS_CHANGED_TOPIC.exec(topic);
+	if (!topicMatch) {
+		return undefined;
+	}
+
 	try {
 		const decoded: unknown = JSON.parse(new TextDecoder().decode(payload));
 		const result = OrderStatusChangedSchema.safeParse(decoded);
-		return result.success ? result.data : undefined;
+		return result.success && result.data.tableId === Number(topicMatch[1])
+			? result.data
+			: undefined;
 	} catch {
 		return undefined;
 	}
@@ -170,13 +253,15 @@ export function decodeKitchenPressurePayload(
 export class RestaurantMqttClient {
 	readonly #url: string;
 	readonly #callbacks: MqttClientCallbacks;
+	readonly #credentials?: BrokerCredentials;
 	#client?: MqttClient;
 	#disconnecting = false;
 	#state: ConnectionState = 'offline';
 
-	constructor(url: string, callbacks: MqttClientCallbacks) {
+	constructor(url: string, callbacks: MqttClientCallbacks, credentials?: BrokerCredentials) {
 		this.#url = url;
 		this.#callbacks = callbacks;
+		this.#credentials = credentials;
 	}
 
 	connect(): void {
@@ -194,7 +279,8 @@ export class RestaurantMqttClient {
 			connectTimeout: 8_000,
 			reconnectPeriod: 1_000,
 			keepalive: 30,
-			queueQoSZero: false
+			queueQoSZero: false,
+			...this.#credentials
 		});
 		this.#client = client;
 
@@ -216,8 +302,8 @@ export class RestaurantMqttClient {
 		});
 
 		client.on('message', (topic, payload) => {
-			if (topic === ORDER_STATUS_CHANGED_TOPIC) {
-				const status = decodeOrderStatusPayload(payload);
+			if (ORDER_STATUS_CHANGED_TOPIC.test(topic)) {
+				const status = decodeOrderStatusPayload(topic, payload);
 				if (!status) {
 					console.warn('mqtt_status_rejected', { topic });
 					this.#callbacks.onError('An invalid order update was ignored.');
@@ -271,10 +357,14 @@ export class RestaurantMqttClient {
 			throw new Error('MQTT client is not ready');
 		}
 
-		await client.publishAsync(ORDER_REQUESTED_TOPIC, JSON.stringify(validatedOrder), {
-			qos: MQTT_QOS,
-			retain: false
-		});
+		await client.publishAsync(
+			orderRequestedTopic(validatedOrder.tableId),
+			JSON.stringify(validatedOrder),
+			{
+				qos: MQTT_QOS,
+				retain: false
+			}
+		);
 		console.info('order_published', {
 			orderId: validatedOrder.orderId,
 			tableId: validatedOrder.tableId

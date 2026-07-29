@@ -1,14 +1,19 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+	clearSessionMqttCredentials,
 	clearStoredMqttUrl,
 	decodeKitchenPressurePayload,
 	decodeOrderStatusPayload,
 	decodeTableSnapshotPayload,
 	MQTT_URL_STORAGE_KEY,
+	normalizeMqttCredentials,
 	normalizeMqttUrl,
+	orderRequestedTopic,
+	readSessionMqttCredentials,
 	readStoredMqttUrl,
 	resolveMqttUrl,
+	storeSessionMqttCredentials,
 	storeMqttUrl
 } from '$lib/mqtt-client';
 
@@ -82,6 +87,44 @@ describe('MQTT browser boundary', () => {
 		expect(readStoredMqttUrl(storage, 'https:')).toBeUndefined();
 	});
 
+	it('stores Broker credentials for the current browser session', () => {
+		const values = new Map<string, string>();
+		const storage = {
+			getItem: (key: string) => values.get(key) ?? null,
+			setItem: (key: string, value: string) => values.set(key, value),
+			removeItem: (key: string) => values.delete(key)
+		};
+
+		storeSessionMqttCredentials(storage, {
+			username: ' restaurant-console ',
+			password: 'demo-secret'
+		});
+		expect(readSessionMqttCredentials(storage)).toEqual({
+			username: 'restaurant-console',
+			password: 'demo-secret'
+		});
+
+		clearSessionMqttCredentials(storage);
+		expect(readSessionMqttCredentials(storage)).toBeUndefined();
+	});
+
+	it('requires a complete username and password pair', () => {
+		expect(normalizeMqttCredentials('', '')).toBeUndefined();
+		expect(() => normalizeMqttCredentials('restaurant-console', '')).toThrow(
+			'Enter both the Broker username and password.'
+		);
+		expect(() => normalizeMqttCredentials('', 'demo-secret')).toThrow(
+			'Enter both the Broker username and password.'
+		);
+	});
+
+	it.each([
+		[1, 'restaurant/v1/table/1/order/requested'],
+		[4, 'restaurant/v1/table/4/order/requested']
+	])('scopes order publishes to table %i', (tableId, expectedTopic) => {
+		expect(orderRequestedTopic(tableId)).toBe(expectedTopic);
+	});
+
 	it('decodes and validates a status update', () => {
 		const status = {
 			schemaVersion: 1,
@@ -93,7 +136,18 @@ describe('MQTT browser boundary', () => {
 			readyAt: '2026-07-29T18:00:03Z'
 		};
 
-		expect(decodeOrderStatusPayload(encoder.encode(JSON.stringify(status)))).toEqual(status);
+		expect(
+			decodeOrderStatusPayload(
+				'restaurant/v1/table/2/order/status-changed',
+				encoder.encode(JSON.stringify(status))
+			)
+		).toEqual(status);
+		expect(
+			decodeOrderStatusPayload(
+				'restaurant/v1/table/4/order/status-changed',
+				encoder.encode(JSON.stringify(status))
+			)
+		).toBeUndefined();
 	});
 
 	it.each([
@@ -116,7 +170,9 @@ describe('MQTT browser boundary', () => {
 			})
 		)
 	])('rejects an invalid status payload without throwing', (payload) => {
-		expect(decodeOrderStatusPayload(payload)).toBeUndefined();
+		expect(
+			decodeOrderStatusPayload('restaurant/v1/table/2/order/status-changed', payload)
+		).toBeUndefined();
 	});
 
 	it('decodes a table snapshot only when topic and payload tables agree', () => {
