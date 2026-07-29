@@ -4,6 +4,8 @@ import { playwright } from '@vitest/browser-playwright';
 import adapter from '@sveltejs/adapter-static';
 import { sveltekit } from '@sveltejs/kit/vite';
 
+const runMqttIntegration = process.env.VITE_RUN_MQTT_INTEGRATION === '1';
+
 export default defineConfig({
 	plugins: [
 		tailwindcss(),
@@ -29,7 +31,10 @@ export default defineConfig({
 						instances: [{ browser: 'chromium', headless: true }]
 					},
 					include: ['src/**/*.svelte.{test,spec}.{js,ts}'],
-					exclude: ['src/lib/server/**']
+					exclude: [
+						'src/lib/server/**',
+						...(runMqttIntegration ? [] : ['src/lib/mqtt-client.svelte.spec.ts'])
+					]
 				}
 			},
 

@@ -34,6 +34,13 @@ export default defineConfig(
 		}
 	},
 	{
+		files: ['src/lib/components/ui/button/button.svelte'],
+		rules: {
+			// This reusable shadcn component must support both internal and external URLs.
+			'svelte/no-navigation-without-resolve': 'off'
+		}
+	},
+	{
 		// Override or add rule settings here, such as:
 		// 'svelte/button-has-type': 'error'
 		rules: {}

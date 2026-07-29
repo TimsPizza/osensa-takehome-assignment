@@ -1,42 +1,16 @@
-# sv
+# OSENSA Restaurant Frontend
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+Svelte 5 client for the restaurant ordering flow. It communicates directly with
+Mosquitto over WebSockets; there is no REST API.
 
-## Creating a project
-
-If you're seeing this, you've probably already done this step. Congrats!
-
-```sh
-# create a new project
-npx sv create my-app
-```
-
-To recreate this project with the same configuration:
+Run the broker and backend from the repository root, then start the UI:
 
 ```sh
-# recreate this project
-pnpm dlx sv@0.16.6 create --template minimal --types ts --add prettier eslint vitest="usages:unit,component" tailwindcss="plugins:none" sveltekit-adapter="adapter:static" --install pnpm ./frontend
+corepack pnpm install
+corepack pnpm dev
 ```
 
-## Developing
+The default local broker URL is `ws://localhost:9001/mqtt`. Set
+`VITE_MQTT_URL` when the broker is hosted elsewhere.
 
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
-
-```sh
-npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
-```
-
-## Building
-
-To create a production version of your app:
-
-```sh
-npm run build
-```
-
-You can preview the production build with `npm run preview`.
-
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+See the repository root README for validation and contract-generation commands.
