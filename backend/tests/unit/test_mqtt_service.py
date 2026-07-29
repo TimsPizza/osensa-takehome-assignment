@@ -3,6 +3,7 @@ import json
 from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import UUID
@@ -155,6 +156,22 @@ def drain_status_updates(service: MqttOrderService) -> tuple[OrderStatusUpdate, 
         updates.append(service._status_updates.get_nowait())
         service._status_updates.task_done()
     return tuple(updates)
+
+
+def test_service_uses_capacity_from_settings_by_default() -> None:
+    settings = replace(
+        make_settings(),
+        order_worker_count=3,
+        order_queue_capacity=17,
+    )
+
+    service = MqttOrderService(settings)
+
+    assert service._worker_count == 3
+    assert service._processing_queue.maxsize == 17
+    pressure = service._pressure_projection.initialize(READY_AT)
+    assert len(pressure.workers) == 3
+    assert pressure.queue_capacity == 17
 
 
 async def test_orders_wait_queued_until_a_worker_is_available() -> None:

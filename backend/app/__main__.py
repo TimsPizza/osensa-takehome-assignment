@@ -16,10 +16,12 @@ def main() -> None:
     settings = Settings.from_env()
     configure_logging(settings.log_level)
     LOGGER.info(
-        "service_starting broker=%s:%d websocket_path=%s",
+        "service_starting broker=%s:%d websocket_path=%s workers=%d queue_capacity=%d",
         settings.mqtt_host,
         settings.mqtt_port,
         settings.mqtt_websocket_path,
+        settings.order_worker_count,
+        settings.order_queue_capacity,
     )
     asyncio.run(async_main(settings))
 

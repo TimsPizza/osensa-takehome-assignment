@@ -56,25 +56,35 @@ class MqttOrderService:
         processor: Processor | None = None,
         registry: OrderRegistry | None = None,
         *,
-        max_concurrent_orders: int = 8,
-        max_queued_orders: int = 256,
+        max_concurrent_orders: int | None = None,
+        max_queued_orders: int | None = None,
         clock: Clock = utc_now,
     ) -> None:
-        if max_concurrent_orders < 1:
-            raise ValueError("max_concurrent_orders must be greater than zero")
-        if max_queued_orders < 1:
-            raise ValueError("max_queued_orders must be greater than zero")
+        worker_count = (
+            settings.order_worker_count
+            if max_concurrent_orders is None
+            else max_concurrent_orders
+        )
+        queue_capacity = (
+            settings.order_queue_capacity
+            if max_queued_orders is None
+            else max_queued_orders
+        )
+        if worker_count < 1 or worker_count > 64:
+            raise ValueError("max_concurrent_orders must be between 1 and 64")
+        if queue_capacity < 1 or queue_capacity > 10_000:
+            raise ValueError("max_queued_orders must be between 1 and 10000")
 
         self._settings = settings
         self._processor = processor if processor is not None else OrderProcessor()
         self._registry = registry if registry is not None else OrderRegistry()
         self._clock = clock
-        self._worker_count = max_concurrent_orders
+        self._worker_count = worker_count
         self._processing_queue: asyncio.Queue[UUID] = asyncio.Queue(
-            maxsize=max_queued_orders,
+            maxsize=queue_capacity,
         )
         self._status_updates: asyncio.Queue[OrderStatusUpdate] = asyncio.Queue(
-            maxsize=(max_concurrent_orders + max_queued_orders) * 4,
+            maxsize=(worker_count + queue_capacity) * 4,
         )
         self._pending_update: OrderStatusUpdate | None = None
         self._service_instance_id = uuid4()
@@ -83,8 +93,8 @@ class MqttOrderService:
         )
         self._pressure_projection = KitchenPressureProjection(
             service_instance_id=self._service_instance_id,
-            worker_count=max_concurrent_orders,
-            queue_capacity=max_queued_orders,
+            worker_count=worker_count,
+            queue_capacity=queue_capacity,
         )
         self._pressure_changed = asyncio.Event()
         self._pending_pressure_snapshot: KitchenPressureSnapshot | None = None

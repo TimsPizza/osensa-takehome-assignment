@@ -43,6 +43,8 @@ services:
       MQTT_PORT: "9001"
       MQTT_WEBSOCKET_PATH: /mqtt
       MQTT_CLIENT_ID: osensa-order-service
+      ORDER_WORKER_COUNT: "${ORDER_WORKER_COUNT:-8}"
+      ORDER_QUEUE_CAPACITY: "${ORDER_QUEUE_CAPACITY:-256}"
       LOG_LEVEL: INFO
     depends_on:
       broker:

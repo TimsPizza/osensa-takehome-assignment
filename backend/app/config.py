@@ -3,13 +3,23 @@ from dataclasses import dataclass
 
 
 def _required_port(name: str, default: int) -> int:
+    return _bounded_int(name, default, minimum=1, maximum=65535)
+
+
+def _bounded_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
     raw_value = os.getenv(name, str(default))
     try:
         value = int(raw_value)
     except ValueError as error:
         raise ValueError(f"{name} must be an integer") from error
-    if not 1 <= value <= 65535:
-        raise ValueError(f"{name} must be between 1 and 65535")
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
     return value
 
 
@@ -35,6 +45,8 @@ class Settings:
     reconnect_delay_seconds: float
     reconnect_max_delay_seconds: float
     log_level: str
+    order_worker_count: int = 8
+    order_queue_capacity: int = 256
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -69,4 +81,16 @@ class Settings:
             reconnect_delay_seconds=reconnect_delay,
             reconnect_max_delay_seconds=reconnect_max_delay,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            order_worker_count=_bounded_int(
+                "ORDER_WORKER_COUNT",
+                8,
+                minimum=1,
+                maximum=64,
+            ),
+            order_queue_capacity=_bounded_int(
+                "ORDER_QUEUE_CAPACITY",
+                256,
+                minimum=1,
+                maximum=10_000,
+            ),
         )
