@@ -8,6 +8,8 @@ image="eclipse-mosquitto:2.1.2-alpine"
 users="restaurant-backend restaurant-console table-1 table-2 table-3 table-4"
 
 chmod 700 "$secrets_directory"
+mosquitto_uid=$(docker run --rm "$image" id -u mosquitto)
+mosquitto_gid=$(docker run --rm "$image" id -g mosquitto)
 
 for user in $users; do
 	secret_path="$secrets_directory/mqtt-${user}-password"
@@ -27,6 +29,10 @@ for user in $users; do
 	openssl rand -base64 32 | tr -d '\n' >"$temporary_directory/mqtt-${user}-password"
 done
 
+# mosquitto_passwd runs as the same numeric identity as the production broker.
+# It needs directory write access to atomically replace its password database.
+chmod 733 "$temporary_directory"
+
 first=1
 for user in $users; do
 	secret_path="$temporary_directory/mqtt-${user}-password"
@@ -39,19 +45,24 @@ for user in $users; do
 
 	secret_value=$(cat "$secret_path")
 	printf '%s\n%s\n' "$secret_value" "$secret_value" | docker run --rm -i \
-		--user "$(id -u):$(id -g)" \
+		--user "$mosquitto_uid:$mosquitto_gid" \
 		-v "$temporary_directory:/run/generated-secrets" \
 		"$image" \
 		mosquitto_passwd $create_flag /run/generated-secrets/mosquitto-passwords "$user"
 done
 
-chmod 600 "$temporary_directory"/mqtt-*-password "$temporary_password_file"
-# File-backed Compose secrets retain their host permissions. These two files
-# must be readable by the non-root Mosquitto and backend container users. The
-# parent secrets directory remains mode 0700 on the host.
-chmod 644 \
-	"$temporary_password_file" \
-	"$temporary_directory/mqtt-restaurant-backend-password"
+docker run --rm \
+	--user "$mosquitto_uid:$mosquitto_gid" \
+	-v "$temporary_directory:/run/generated-secrets" \
+	"$image" \
+	chmod 600 /run/generated-secrets/mosquitto-passwords
+
+chmod 700 "$temporary_directory"
+chmod 600 "$temporary_directory"/mqtt-*-password
+# File-backed Compose secrets retain host permissions. The backend runs under
+# a different non-root UID, so its mounted plaintext credential must be
+# world-readable inside the container. The host secrets directory is mode 0700.
+chmod 644 "$temporary_directory/mqtt-restaurant-backend-password"
 for generated_file in "$temporary_directory"/*; do
 	mv "$generated_file" "$secrets_directory/"
 done
