@@ -81,7 +81,9 @@ class MqttOrderService:
             clean_session=True,
             transport="websockets",
             websocket_path=self._settings.mqtt_websocket_path,
-            max_queued_incoming_messages=100,
+            # A bounded aiomqtt queue silently discards overflow. Admission control
+            # belongs to _processing_queue, where callers receive an explicit failure.
+            max_queued_incoming_messages=0,
             max_concurrent_outgoing_calls=10,
         )
 
