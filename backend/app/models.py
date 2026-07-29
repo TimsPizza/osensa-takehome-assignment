@@ -88,9 +88,45 @@ class TableSnapshot(WireModel):
     orders: tuple[OrderStatusUpdate, ...] = Field(max_length=10)
 
 
+class KitchenWorkerIdle(WireModel):
+    worker_id: int = Field(alias="workerId", strict=True, ge=1, le=64)
+    status: Literal["idle"]
+
+
+class KitchenWorkerProcessing(WireModel):
+    worker_id: int = Field(alias="workerId", strict=True, ge=1, le=64)
+    status: Literal["processing"]
+    order_id: UUID = Field(alias="orderId")
+    table_id: int = Field(alias="tableId", strict=True, ge=1, le=4)
+    food_name: str = Field(
+        alias="foodName",
+        strict=True,
+        min_length=1,
+        max_length=100,
+        pattern=r"^\S(?:.*\S)?$",
+    )
+
+
+type KitchenWorkerState = Annotated[
+    KitchenWorkerIdle | KitchenWorkerProcessing,
+    Field(discriminator="status"),
+]
+
+
+class KitchenPressureSnapshot(WireModel):
+    schema_version: Literal[1] = Field(alias="schemaVersion")
+    service_instance_id: UUID = Field(alias="serviceInstanceId")
+    revision: int = Field(strict=True, ge=0)
+    generated_at: AwareDatetime = Field(alias="generatedAt")
+    queued_orders: int = Field(alias="queuedOrders", strict=True, ge=0)
+    queue_capacity: int = Field(alias="queueCapacity", strict=True, ge=1, le=10_000)
+    workers: tuple[KitchenWorkerState, ...] = Field(min_length=1, max_length=64)
+
+
 # Explicit roots prevent internal Pydantic models from leaking into the frontend contract.
 CODEGEN_TARGETS: Final[tuple[tuple[type[BaseModel], SchemaMode], ...]] = (
     (OrderRequested, "validation"),
     (OrderStatusChanged, "serialization"),
     (TableSnapshot, "serialization"),
+    (KitchenPressureSnapshot, "serialization"),
 )

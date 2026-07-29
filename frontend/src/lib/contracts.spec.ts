@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+	KitchenPressureSnapshotSchema,
 	OrderRequestedSchema,
 	OrderStatusChangedSchema,
 	TableSnapshotSchema
@@ -100,5 +101,28 @@ describe('generated MQTT contracts', () => {
 		};
 
 		expect(TableSnapshotSchema.safeParse(snapshot).success).toBe(false);
+	});
+
+	it('accepts queue capacity and discriminated worker states', () => {
+		const pressure = {
+			schemaVersion: 1,
+			serviceInstanceId: '1058bf2e-0ef0-4ae6-a3bc-267f1abbbd54',
+			revision: 7,
+			generatedAt: '2026-07-29T18:00:04Z',
+			queuedOrders: 3,
+			queueCapacity: 256,
+			workers: [
+				{ workerId: 1, status: 'idle' },
+				{
+					workerId: 2,
+					status: 'processing',
+					orderId: validOrder.orderId,
+					tableId: validOrder.tableId,
+					foodName: validOrder.foodName
+				}
+			]
+		};
+
+		expect(KitchenPressureSnapshotSchema.parse(pressure)).toEqual(pressure);
 	});
 });

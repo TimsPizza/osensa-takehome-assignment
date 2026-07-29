@@ -120,3 +120,34 @@ export const TableSnapshotSchema = z
 	})
 	.strict();
 export type TableSnapshot = z.infer<typeof TableSnapshotSchema>;
+
+export const KitchenPressureSnapshotSchema = z
+	.object({
+		schemaVersion: z.literal(1),
+		serviceInstanceId: z.string().uuid(),
+		revision: z.number().int().gte(0),
+		generatedAt: z.string().datetime({ offset: true }),
+		queuedOrders: z.number().int().gte(0),
+		queueCapacity: z.number().int().gte(1).lte(10000),
+		workers: z
+			.array(
+				z.discriminatedUnion('status', [
+					z
+						.object({ workerId: z.number().int().gte(1).lte(64), status: z.literal('idle') })
+						.strict(),
+					z
+						.object({
+							workerId: z.number().int().gte(1).lte(64),
+							status: z.literal('processing'),
+							orderId: z.string().uuid(),
+							tableId: z.number().int().gte(1).lte(4),
+							foodName: z.string().regex(new RegExp('^\\S(?:.*\\S)?$')).min(1).max(100)
+						})
+						.strict()
+				])
+			)
+			.min(1)
+			.max(64)
+	})
+	.strict();
+export type KitchenPressureSnapshot = z.infer<typeof KitchenPressureSnapshotSchema>;

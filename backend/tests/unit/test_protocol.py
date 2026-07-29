@@ -5,11 +5,13 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from app.models import FoodReady, OrderFailed, TableSnapshot
+from app.models import FoodReady, KitchenPressureSnapshot, OrderFailed, TableSnapshot
 from app.protocol import (
+    decode_kitchen_pressure,
     decode_order_requested,
     decode_order_status_changed,
     decode_table_snapshot,
+    encode_kitchen_pressure,
     encode_order_status_changed,
     encode_table_snapshot,
     table_snapshot_topic,
@@ -112,3 +114,22 @@ def test_table_snapshot_round_trips_and_uses_a_table_scoped_topic() -> None:
 def test_table_snapshot_topic_rejects_an_unknown_table(table_id: int) -> None:
     with pytest.raises(ValueError):
         table_snapshot_topic(table_id)
+
+
+def test_kitchen_pressure_round_trips() -> None:
+    snapshot = KitchenPressureSnapshot(
+        schemaVersion=1,
+        serviceInstanceId=uuid4(),
+        revision=4,
+        generatedAt=datetime(2026, 7, 28, 20, 15, 31, tzinfo=UTC),
+        queuedOrders=3,
+        queueCapacity=256,
+        workers=(
+            {
+                "workerId": 1,
+                "status": "idle",
+            },
+        ),
+    )
+
+    assert decode_kitchen_pressure(encode_kitchen_pressure(snapshot)) == snapshot
