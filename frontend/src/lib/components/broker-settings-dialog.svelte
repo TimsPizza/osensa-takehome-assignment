@@ -6,20 +6,27 @@
 	import * as Dialog from '$lib/components/ui/dialog';
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
-	import { normalizeMqttUrl } from '$lib/mqtt-client';
+	import {
+		normalizeMqttCredentials,
+		normalizeMqttUrl,
+		type BrokerConnectionSettings,
+		type BrokerCredentials
+	} from '$lib/mqtt-client';
 
 	interface Props {
 		open: boolean;
 		activeUrl: string;
+		activeCredentials?: BrokerCredentials;
 		defaultUrl: string;
 		pageProtocol: string;
-		onSave: (url: string) => Promise<void>;
+		onSave: (settings: BrokerConnectionSettings) => Promise<void>;
 		onReset: () => Promise<void>;
 	}
 
 	let {
 		open = $bindable(),
 		activeUrl,
+		activeCredentials,
 		defaultUrl,
 		pageProtocol,
 		onSave,
@@ -27,12 +34,16 @@
 	}: Props = $props();
 
 	let draftUrl = $state('');
+	let draftUsername = $state('');
+	let draftPassword = $state('');
 	let formError = $state('');
 	let saving = $state(false);
 
 	$effect(() => {
 		if (open) {
 			draftUrl = activeUrl;
+			draftUsername = activeCredentials?.username ?? '';
+			draftPassword = activeCredentials?.password ?? '';
 			formError = '';
 		}
 	});
@@ -43,18 +54,21 @@
 			return;
 		}
 
-		let normalizedUrl: string;
+		let settings: BrokerConnectionSettings;
 		try {
-			normalizedUrl = normalizeMqttUrl(draftUrl, pageProtocol);
+			settings = {
+				url: normalizeMqttUrl(draftUrl, pageProtocol),
+				credentials: normalizeMqttCredentials(draftUsername, draftPassword)
+			};
 		} catch (error) {
-			formError = error instanceof Error ? error.message : 'The Broker URL is invalid.';
+			formError = error instanceof Error ? error.message : 'The Broker settings are invalid.';
 			return;
 		}
 
 		saving = true;
 		formError = '';
 		try {
-			await onSave(normalizedUrl);
+			await onSave(settings);
 			open = false;
 		} catch (error) {
 			formError = error instanceof Error ? error.message : 'The Broker setting could not be saved.';
@@ -92,7 +106,8 @@
 			</div>
 			<Dialog.Title>Broker connection</Dialog.Title>
 			<Dialog.Description class="min-w-0">
-				Choose the MQTT WebSocket endpoint used by this browser. The override stays on this device.
+				This four-table page connects as a restaurant console. Credentials last only for this
+				browser tab.
 			</Dialog.Description>
 		</Dialog.Header>
 
@@ -108,21 +123,53 @@
 					autocomplete="url"
 					class="max-w-full"
 					aria-invalid={formError ? 'true' : undefined}
-					aria-describedby={formError ? 'broker-url-error' : 'broker-url-help'}
+					aria-describedby="broker-url-help"
 					bind:value={draftUrl}
 				/>
 				<p id="broker-url-help" class="text-xs leading-5 text-stone-500">
 					Deployment default: <span class="font-mono break-all">{defaultUrl}</span>
 				</p>
-				{#if formError}
-					<p id="broker-url-error" class="text-sm text-red-700" role="alert">{formError}</p>
-				{/if}
 			</div>
+
+			<div class="grid min-w-0 gap-4 sm:grid-cols-2">
+				<div class="min-w-0 space-y-2">
+					<Label for="broker-username">Username</Label>
+					<Input
+						id="broker-username"
+						name="brokerUsername"
+						placeholder="restaurant-console"
+						maxlength={128}
+						autocomplete="username"
+						class="max-w-full"
+						aria-invalid={formError ? 'true' : undefined}
+						bind:value={draftUsername}
+					/>
+				</div>
+				<div class="min-w-0 space-y-2">
+					<Label for="broker-password">Password</Label>
+					<Input
+						id="broker-password"
+						name="brokerPassword"
+						type="password"
+						placeholder="Optional for local development"
+						maxlength={512}
+						autocomplete="current-password"
+						class="max-w-full"
+						aria-invalid={formError ? 'true' : undefined}
+						bind:value={draftPassword}
+					/>
+				</div>
+			</div>
+
+			{#if formError}
+				<p id="broker-settings-error" class="text-sm text-red-700" role="alert">{formError}</p>
+			{/if}
 
 			<div
 				class="min-w-0 rounded-lg border border-stone-200 bg-stone-50 px-3 py-2.5 text-xs text-stone-600"
 			>
-				Saving disconnects the current session and reconnects both panels to the new Broker.
+				The endpoint persists on this device. Credentials use session storage so refresh works, but
+				closing the tab clears them.
 			</div>
 
 			<Dialog.Footer class="min-w-0 gap-2 sm:flex-wrap sm:justify-between">

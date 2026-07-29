@@ -18,11 +18,16 @@
 	import { Label } from '$lib/components/ui/label';
 	import { OrderRequestedSchema, type KitchenPressureSnapshot } from '$lib/generated/contracts';
 	import {
+		clearSessionMqttCredentials,
 		clearStoredMqttUrl,
+		readSessionMqttCredentials,
 		readStoredMqttUrl,
 		RestaurantMqttClient,
 		resolveMqttUrl,
+		storeSessionMqttCredentials,
 		storeMqttUrl,
+		type BrokerConnectionSettings,
+		type BrokerCredentials,
 		type ConnectionState,
 		type MqttClientCallbacks
 	} from '$lib/mqtt-client';
@@ -52,6 +57,7 @@
 	let activePanel = $state<AppPanel>('restaurant');
 	let brokerSettingsOpen = $state(false);
 	let activeBrokerUrl = $state('');
+	let activeBrokerCredentials = $state<BrokerCredentials>();
 	let defaultBrokerUrl = $state('');
 	let pageProtocol = $state('');
 	const bulkOrderingTables = new SvelteSet<TableId>();
@@ -79,7 +85,7 @@
 		}
 	});
 
-	function createMqttClient(url: string): RestaurantMqttClient {
+	function createMqttClient(url: string, credentials?: BrokerCredentials): RestaurantMqttClient {
 		const callbacks: MqttClientCallbacks = {
 			onConnectionChange: (state) => {
 				connectionState = state;
@@ -116,10 +122,10 @@
 				connectionError = message;
 			}
 		};
-		return new RestaurantMqttClient(url, callbacks);
+		return new RestaurantMqttClient(url, callbacks, credentials);
 	}
 
-	async function reconnectToBroker(url: string): Promise<void> {
+	async function reconnectToBroker(settings: BrokerConnectionSettings): Promise<void> {
 		const generation = ++connectionGeneration;
 		const previousClient = mqttClient;
 		mqttClient = undefined;
@@ -132,20 +138,26 @@
 			return;
 		}
 
-		activeBrokerUrl = url;
-		const nextClient = createMqttClient(url);
+		activeBrokerUrl = settings.url;
+		activeBrokerCredentials = settings.credentials;
+		const nextClient = createMqttClient(settings.url, settings.credentials);
 		mqttClient = nextClient;
 		nextClient.connect();
 	}
 
-	async function saveBrokerUrl(url: string): Promise<void> {
-		const storedUrl = storeMqttUrl(window.localStorage, url, pageProtocol);
-		await reconnectToBroker(storedUrl);
+	async function saveBrokerSettings(settings: BrokerConnectionSettings): Promise<void> {
+		const storedUrl = storeMqttUrl(window.localStorage, settings.url, pageProtocol);
+		storeSessionMqttCredentials(window.sessionStorage, settings.credentials);
+		await reconnectToBroker({
+			url: storedUrl,
+			credentials: settings.credentials
+		});
 	}
 
 	async function resetBrokerUrl(): Promise<void> {
 		clearStoredMqttUrl(window.localStorage);
-		await reconnectToBroker(defaultBrokerUrl);
+		clearSessionMqttCredentials(window.sessionStorage);
+		await reconnectToBroker({ url: defaultBrokerUrl });
 	}
 
 	onMount(() => {
@@ -153,7 +165,8 @@
 		defaultBrokerUrl = resolveMqttUrl(window.location, import.meta.env.VITE_MQTT_URL);
 		activeBrokerUrl =
 			readStoredMqttUrl(window.localStorage, window.location.protocol) ?? defaultBrokerUrl;
-		mqttClient = createMqttClient(activeBrokerUrl);
+		activeBrokerCredentials = readSessionMqttCredentials(window.sessionStorage);
+		mqttClient = createMqttClient(activeBrokerUrl, activeBrokerCredentials);
 		mqttClient.connect();
 
 		return () => {
@@ -381,8 +394,9 @@
 <BrokerSettingsDialog
 	bind:open={brokerSettingsOpen}
 	activeUrl={activeBrokerUrl}
+	activeCredentials={activeBrokerCredentials}
 	defaultUrl={defaultBrokerUrl}
 	{pageProtocol}
-	onSave={saveBrokerUrl}
+	onSave={saveBrokerSettings}
 	onReset={resetBrokerUrl}
 />
