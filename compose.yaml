@@ -1,6 +1,38 @@
 name: osensa-restaurant
 
 services:
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    read_only: true
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-5173}:8080"
+    tmpfs:
+      - /config
+      - /data
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    pids_limit: 100
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--quiet",
+          "--spider",
+          "http://localhost:8080/healthz",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 2s
+    depends_on:
+      broker:
+        condition: service_healthy
+
   broker:
     image: eclipse-mosquitto:2.1.2-alpine
     restart: unless-stopped

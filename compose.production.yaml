@@ -1,4 +1,8 @@
 services:
+  frontend:
+    profiles:
+      - local-ui
+
   broker:
     ports: !reset []
     volumes:
