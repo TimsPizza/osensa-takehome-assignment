@@ -1,9 +1,11 @@
 <script lang="ts">
 	import ActivityIcon from '@lucide/svelte/icons/activity';
+	import ChevronDownIcon from '@lucide/svelte/icons/chevron-down';
+	import ChevronUpIcon from '@lucide/svelte/icons/chevron-up';
 	import CircleAlertIcon from '@lucide/svelte/icons/circle-alert';
+	import GripHorizontalIcon from '@lucide/svelte/icons/grip-horizontal';
 
-	import { Badge } from '$lib/components/ui/badge';
-	import * as Card from '$lib/components/ui/card';
+	import { Button } from '$lib/components/ui/button';
 	import type { KitchenPressureSnapshot } from '$lib/generated/contracts';
 
 	interface Props {
@@ -11,7 +13,22 @@
 		connected: boolean;
 	}
 
+	interface Position {
+		x: number;
+		y: number;
+	}
+
+	interface DragState {
+		pointerId: number;
+		offsetX: number;
+		offsetY: number;
+	}
+
 	let { snapshot, connected }: Props = $props();
+	let root: HTMLDivElement;
+	let expanded = $state(false);
+	let position = $state<Position>();
+	let drag: DragState | undefined;
 
 	const busyWorkers = $derived(
 		snapshot?.workers.filter((worker) => worker.status === 'processing') ?? []
@@ -22,54 +39,121 @@
 	const atCapacity = $derived(
 		snapshot !== undefined && snapshot.queuedOrders >= snapshot.queueCapacity
 	);
+
+	function startDrag(event: PointerEvent): void {
+		if (event.button !== 0 || window.innerWidth < 768) return;
+		const bounds = root.getBoundingClientRect();
+		position = { x: bounds.left, y: bounds.top };
+		drag = {
+			pointerId: event.pointerId,
+			offsetX: event.clientX - bounds.left,
+			offsetY: event.clientY - bounds.top
+		};
+		(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+	}
+
+	function moveDrag(event: PointerEvent): void {
+		if (!drag || drag.pointerId !== event.pointerId) return;
+		position = clampPosition({
+			x: event.clientX - drag.offsetX,
+			y: event.clientY - drag.offsetY
+		});
+	}
+
+	function stopDrag(event: PointerEvent): void {
+		if (drag?.pointerId !== event.pointerId) return;
+		drag = undefined;
+	}
+
+	function clampPosition(next = position): Position | undefined {
+		if (!next || !root) return next;
+		const gutter = 12;
+		const maximumX = Math.max(gutter, window.innerWidth - root.offsetWidth - gutter);
+		const maximumY = Math.max(gutter, window.innerHeight - root.offsetHeight - gutter);
+		return {
+			x: Math.min(Math.max(gutter, next.x), maximumX),
+			y: Math.min(Math.max(gutter, next.y), maximumY)
+		};
+	}
+
+	function handleResize(): void {
+		if (window.innerWidth < 768) {
+			position = undefined;
+			return;
+		}
+		position = clampPosition();
+	}
+
+	function toggleExpanded(): void {
+		expanded = !expanded;
+		requestAnimationFrame(() => {
+			position = clampPosition();
+		});
+	}
 </script>
 
-<Card.Root
-	class="mb-6 border-stone-200/90 bg-stone-950 text-stone-50 shadow-[0_18px_50px_-32px_rgba(28,25,23,0.7)]"
->
-	<Card.Header class="gap-4 border-b border-white/10">
-		<div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-			<div>
-				<div
-					class="flex items-center gap-2 text-xs font-semibold tracking-[0.16em] text-amber-300 uppercase"
-				>
-					<ActivityIcon class="size-4" />
-					Bounded concurrency
-				</div>
-				<Card.Title class="mt-2 text-xl text-white">Kitchen pressure</Card.Title>
-				<Card.Description class="mt-1 max-w-2xl text-stone-400">
-					The waiting queue is capped. Every order beyond that boundary receives an explicit
-					overload response.
-				</Card.Description>
-			</div>
-			<Badge
-				variant="outline"
-				class={connected
-					? 'border-white/15 bg-white/5 text-stone-200'
-					: 'border-amber-400/30 bg-amber-400/10 text-amber-200'}
-			>
-				{snapshot ? 'Live backend telemetry' : 'Waiting for telemetry'}
-			</Badge>
-		</div>
-	</Card.Header>
+<svelte:window onresize={handleResize} />
 
-	<Card.Content class="space-y-6">
-		{#if snapshot}
-			<div class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
+<div
+	bind:this={root}
+	class={`fixed z-50 w-[calc(100vw-1.5rem)] overflow-hidden rounded-2xl border border-white/10 bg-stone-950 text-white shadow-2xl shadow-stone-950/30 sm:w-96 ${
+		expanded ? 'md:w-[42rem]' : ''
+	} ${position ? '' : 'right-3 bottom-3 sm:right-5 sm:bottom-5'}`}
+	style={position ? `left:${position.x}px;top:${position.y}px` : undefined}
+	aria-label="Kitchen pressure monitor"
+>
+	<div class="flex items-center gap-3 border-b border-white/10 px-4 py-3">
+		<button
+			type="button"
+			class="hidden cursor-move touch-none text-stone-500 hover:text-stone-300 md:block"
+			aria-label="Drag kitchen pressure monitor"
+			onpointerdown={startDrag}
+			onpointermove={moveDrag}
+			onpointerup={stopDrag}
+			onpointercancel={stopDrag}
+		>
+			<GripHorizontalIcon class="size-5" />
+		</button>
+		<span class="flex size-8 items-center justify-center rounded-lg bg-amber-400/15 text-amber-300">
+			<ActivityIcon class="size-4" />
+		</span>
+		<div class="min-w-0 flex-1">
+			<div class="flex items-center gap-2">
+				<p class="text-sm font-semibold">Kitchen pressure</p>
+				<span class={`size-1.5 rounded-full ${connected ? 'bg-emerald-400' : 'bg-amber-400'}`}
+				></span>
+			</div>
+			<p class="truncate text-[0.6875rem] text-stone-500">
+				{snapshot ? `Revision ${snapshot.revision}` : 'Waiting for telemetry'}
+			</p>
+		</div>
+		<Button
+			variant="ghost"
+			size="icon-sm"
+			class="text-stone-400 hover:bg-white/10 hover:text-white"
+			aria-label={expanded ? 'Collapse pressure monitor' : 'Expand pressure monitor'}
+			onclick={toggleExpanded}
+		>
+			{#if expanded}
+				<ChevronDownIcon />
+			{:else}
+				<ChevronUpIcon />
+			{/if}
+		</Button>
+	</div>
+
+	{#if snapshot}
+		<div class="space-y-3 px-4 py-3">
+			<div class="grid grid-cols-[1fr_auto] items-end gap-4">
 				<div>
-					<div class="mb-2 flex items-end justify-between gap-4">
-						<div>
-							<p class="text-sm font-medium text-stone-200">Waiting queue</p>
-							<p class="mt-0.5 text-xs text-stone-400">
-								{snapshot.queuedOrders} of {snapshot.queueCapacity} slots occupied
-							</p>
-						</div>
-						<p class="font-mono text-2xl font-semibold text-white tabular-nums">
-							{Math.round(queuePercent)}%
-						</p>
+					<div class="mb-1.5 flex items-center justify-between text-xs">
+						<span class="text-stone-400">Waiting queue</span>
+						<span class="font-mono font-medium tabular-nums">
+							{snapshot.queuedOrders}/{snapshot.queueCapacity}
+						</span>
 					</div>
 					<div
-						class="h-3 overflow-hidden rounded-full bg-white/10 ring-1 ring-white/10"
+						class="h-2 overflow-hidden rounded-full bg-white/10"
 						role="progressbar"
 						aria-label="Waiting queue utilization"
 						aria-valuemin="0"
@@ -80,82 +164,71 @@
 							class={`h-full rounded-full transition-[width,background-color] duration-300 ${
 								atCapacity ? 'bg-red-500' : queuePercent >= 75 ? 'bg-amber-400' : 'bg-emerald-500'
 							}`}
-							style={`width: ${queuePercent}%`}
+							style={`width:${queuePercent}%`}
 						></div>
 					</div>
 				</div>
-
-				<div class="flex gap-6 rounded-xl border border-white/10 bg-white/5 px-5 py-3">
-					<div>
-						<p class="text-xs text-stone-400">Workers busy</p>
-						<p class="mt-1 font-mono text-xl font-semibold tabular-nums">
-							{busyWorkers.length}/{snapshot.workers.length}
-						</p>
-					</div>
-					<div>
-						<p class="text-xs text-stone-400">Admission limit</p>
-						<p class="mt-1 font-mono text-xl font-semibold tabular-nums">
-							{snapshot.queueCapacity + snapshot.workers.length}
-						</p>
-					</div>
+				<div class="text-right">
+					<p class="text-[0.6875rem] text-stone-500">Workers</p>
+					<p class="font-mono text-lg font-semibold tabular-nums">
+						{busyWorkers.length}/{snapshot.workers.length}
+					</p>
 				</div>
 			</div>
 
 			{#if atCapacity}
-				<div
-					class="flex items-start gap-2 rounded-lg border border-red-400/25 bg-red-400/10 px-3 py-2 text-sm text-red-100"
-					role="status"
-				>
-					<CircleAlertIcon class="mt-0.5 size-4 shrink-0" />
-					Queue full — new orders are rejected with the retryable
-					<code class="font-mono text-xs">service_overloaded</code> status.
-				</div>
+				<p class="flex items-center gap-2 text-xs font-medium text-red-300" role="status">
+					<CircleAlertIcon class="size-3.5" />
+					Queue full — excess orders return service_overloaded.
+				</p>
 			{/if}
 
-			<div>
-				<div class="mb-2 flex items-center justify-between">
-					<p class="text-sm font-medium text-stone-200">Worker pool</p>
-					<p class="text-xs text-stone-500">One order per worker</p>
+			{#if expanded}
+				<div class="border-t border-white/10 pt-3">
+					<div class="mb-2 flex items-center justify-between">
+						<p class="text-xs font-medium text-stone-300">Worker pool</p>
+						<p class="text-[0.6875rem] text-stone-500">
+							Admission limit {snapshot.queueCapacity + snapshot.workers.length}
+						</p>
+					</div>
+					<ul class="grid grid-cols-2 gap-2 sm:grid-cols-4" aria-label="Worker states">
+						{#each snapshot.workers as worker (worker.workerId)}
+							<li
+								class={`min-w-0 rounded-lg border px-3 py-2 ${
+									worker.status === 'processing'
+										? 'border-amber-400/25 bg-amber-400/10'
+										: 'border-white/10 bg-white/5'
+								}`}
+							>
+								<div class="flex items-center gap-2">
+									<span
+										class={`size-2 rounded-full ${
+											worker.status === 'processing'
+												? 'animate-pulse bg-amber-400'
+												: 'bg-emerald-500'
+										}`}
+									></span>
+									<p class="font-mono text-xs font-semibold">
+										W{String(worker.workerId).padStart(2, '0')}
+									</p>
+								</div>
+								{#if worker.status === 'processing'}
+									<p class="mt-1.5 truncate text-xs" title={worker.foodName}>
+										{worker.foodName}
+									</p>
+									<p class="mt-0.5 text-[0.6875rem] text-amber-200">Table {worker.tableId}</p>
+								{:else}
+									<p class="mt-1.5 text-xs text-stone-500">Idle</p>
+								{/if}
+							</li>
+						{/each}
+					</ul>
 				</div>
-				<ul class="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8" aria-label="Worker states">
-					{#each snapshot.workers as worker (worker.workerId)}
-						<li
-							class={`min-w-0 rounded-lg border px-3 py-2 ${
-								worker.status === 'processing'
-									? 'border-amber-400/30 bg-amber-400/10'
-									: 'border-white/10 bg-white/5'
-							}`}
-						>
-							<div class="flex items-center gap-2">
-								<span
-									class={`size-2 shrink-0 rounded-full ${
-										worker.status === 'processing' ? 'animate-pulse bg-amber-400' : 'bg-emerald-500'
-									}`}
-								></span>
-								<p class="font-mono text-xs font-semibold text-stone-200">
-									W{String(worker.workerId).padStart(2, '0')}
-								</p>
-							</div>
-							{#if worker.status === 'processing'}
-								<p class="mt-2 truncate text-xs font-medium text-white" title={worker.foodName}>
-									{worker.foodName}
-								</p>
-								<p class="mt-0.5 text-[0.6875rem] text-amber-200">Table {worker.tableId}</p>
-							{:else}
-								<p class="mt-2 text-xs text-stone-500">Idle</p>
-							{/if}
-						</li>
-					{/each}
-				</ul>
-			</div>
-		{:else}
-			<div class="rounded-xl border border-dashed border-white/15 px-4 py-8 text-center">
-				<p class="text-sm text-stone-400">
-					{connected
-						? 'Waiting for the retained pressure snapshot…'
-						: 'Connect to view queue pressure.'}
-				</p>
-			</div>
-		{/if}
-	</Card.Content>
-</Card.Root>
+			{/if}
+		</div>
+	{:else}
+		<p class="px-4 py-4 text-sm text-stone-400">
+			{connected ? 'Waiting for retained pressure snapshot…' : 'Connect to view pressure.'}
+		</p>
+	{/if}
+</div>
