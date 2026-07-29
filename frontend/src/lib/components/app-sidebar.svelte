@@ -5,6 +5,7 @@
 <script lang="ts">
 	import FlaskConicalIcon from '@lucide/svelte/icons/flask-conical';
 	import RadioIcon from '@lucide/svelte/icons/radio';
+	import Settings2Icon from '@lucide/svelte/icons/settings-2';
 	import UtensilsIcon from '@lucide/svelte/icons/utensils';
 
 	import type { ConnectionState } from '$lib/mqtt-client';
@@ -13,9 +14,10 @@
 		activePanel: AppPanel;
 		connectionState: ConnectionState;
 		onNavigate: (panel: AppPanel) => void;
+		onConfigureBroker: () => void;
 	}
 
-	let { activePanel, connectionState, onNavigate }: Props = $props();
+	let { activePanel, connectionState, onNavigate, onConfigureBroker }: Props = $props();
 
 	const connected = $derived(connectionState === 'connected');
 	const connectionCopy = $derived.by(() => {
@@ -86,13 +88,18 @@
 	</nav>
 
 	<div class="border-t border-white/10 p-5">
-		<div class="flex items-center gap-3 rounded-xl bg-white/5 px-3 py-3">
+		<button
+			type="button"
+			class="flex w-full items-center gap-3 rounded-xl bg-white/5 px-3 py-3 text-left transition-colors hover:bg-white/10 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-300"
+			onclick={onConfigureBroker}
+		>
 			<RadioIcon class={`size-4 ${connected ? 'text-emerald-400' : 'text-amber-400'}`} />
-			<div>
+			<div class="min-w-0 flex-1">
 				<p class="text-xs font-medium text-stone-200">{connectionCopy}</p>
-				<p class="mt-0.5 text-[0.6875rem] text-stone-500">MQTT over WebSockets</p>
+				<p class="mt-0.5 text-[0.6875rem] text-stone-500">Configure Broker</p>
 			</div>
-		</div>
+			<Settings2Icon class="size-4 text-stone-500" />
+		</button>
 	</div>
 </aside>
 
@@ -117,6 +124,14 @@
 					{item.label}
 				</button>
 			{/each}
+			<button
+				type="button"
+				class="flex size-7 items-center justify-center rounded-md text-stone-500 hover:bg-white hover:text-stone-950"
+				aria-label="Configure Broker connection"
+				onclick={onConfigureBroker}
+			>
+				<Settings2Icon class="size-4" />
+			</button>
 		</div>
 	</div>
 </div>

@@ -8,6 +8,7 @@
 	import { BoundaryTestController } from '$lib/boundary-test-controller';
 	import AppSidebar, { type AppPanel } from '$lib/components/app-sidebar.svelte';
 	import BoundaryLab from '$lib/components/boundary-lab.svelte';
+	import BrokerSettingsDialog from '$lib/components/broker-settings-dialog.svelte';
 	import KitchenPressure from '$lib/components/kitchen-pressure.svelte';
 	import TableCard from '$lib/components/table-card.svelte';
 	import { Badge } from '$lib/components/ui/badge';
@@ -16,7 +17,15 @@
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
 	import { OrderRequestedSchema, type KitchenPressureSnapshot } from '$lib/generated/contracts';
-	import { RestaurantMqttClient, resolveMqttUrl, type ConnectionState } from '$lib/mqtt-client';
+	import {
+		clearStoredMqttUrl,
+		readStoredMqttUrl,
+		RestaurantMqttClient,
+		resolveMqttUrl,
+		storeMqttUrl,
+		type ConnectionState,
+		type MqttClientCallbacks
+	} from '$lib/mqtt-client';
 	import {
 		addSendingOrder,
 		applyOrderStatus,
@@ -41,6 +50,10 @@
 	let formError = $state('');
 	let submitting = $state(false);
 	let activePanel = $state<AppPanel>('restaurant');
+	let brokerSettingsOpen = $state(false);
+	let activeBrokerUrl = $state('');
+	let defaultBrokerUrl = $state('');
+	let pageProtocol = $state('');
 	const bulkOrderingTables = new SvelteSet<TableId>();
 	const snapshotCursors = new SvelteMap<TableId, TableSnapshotCursor>();
 	let mqttClient: RestaurantMqttClient | undefined;
@@ -50,6 +63,7 @@
 		}
 		await mqttClient.publishOrder(order);
 	});
+	let connectionGeneration = 0;
 
 	const connected = $derived(connectionState === 'connected');
 	const connectionCopy = $derived.by(() => {
@@ -65,9 +79,8 @@
 		}
 	});
 
-	onMount(() => {
-		const url = resolveMqttUrl(window.location, import.meta.env.VITE_MQTT_URL);
-		mqttClient = new RestaurantMqttClient(url, {
+	function createMqttClient(url: string): RestaurantMqttClient {
+		const callbacks: MqttClientCallbacks = {
 			onConnectionChange: (state) => {
 				connectionState = state;
 				if (state === 'connected') {
@@ -102,10 +115,49 @@
 			onError: (message) => {
 				connectionError = message;
 			}
-		});
+		};
+		return new RestaurantMqttClient(url, callbacks);
+	}
+
+	async function reconnectToBroker(url: string): Promise<void> {
+		const generation = ++connectionGeneration;
+		const previousClient = mqttClient;
+		mqttClient = undefined;
+		connectionState = 'connecting';
+		connectionError = '';
+		kitchenPressure = undefined;
+
+		await previousClient?.disconnect();
+		if (generation !== connectionGeneration) {
+			return;
+		}
+
+		activeBrokerUrl = url;
+		const nextClient = createMqttClient(url);
+		mqttClient = nextClient;
+		nextClient.connect();
+	}
+
+	async function saveBrokerUrl(url: string): Promise<void> {
+		const storedUrl = storeMqttUrl(window.localStorage, url, pageProtocol);
+		await reconnectToBroker(storedUrl);
+	}
+
+	async function resetBrokerUrl(): Promise<void> {
+		clearStoredMqttUrl(window.localStorage);
+		await reconnectToBroker(defaultBrokerUrl);
+	}
+
+	onMount(() => {
+		pageProtocol = window.location.protocol;
+		defaultBrokerUrl = resolveMqttUrl(window.location, import.meta.env.VITE_MQTT_URL);
+		activeBrokerUrl =
+			readStoredMqttUrl(window.localStorage, window.location.protocol) ?? defaultBrokerUrl;
+		mqttClient = createMqttClient(activeBrokerUrl);
 		mqttClient.connect();
 
 		return () => {
+			connectionGeneration += 1;
 			boundaryTests.destroy();
 			void mqttClient?.disconnect();
 		};
@@ -198,7 +250,12 @@
 </svelte:head>
 
 <div class="min-h-screen bg-[linear-gradient(180deg,#fafaf9_0%,#f5f5f4_55%,#ede9e3_100%)]">
-	<AppSidebar {activePanel} {connectionState} onNavigate={(panel) => (activePanel = panel)} />
+	<AppSidebar
+		{activePanel}
+		{connectionState}
+		onNavigate={(panel) => (activePanel = panel)}
+		onConfigureBroker={() => (brokerSettingsOpen = true)}
+	/>
 
 	<main class="lg:pl-72">
 		<div class="mx-auto max-w-[96rem] px-4 py-8 sm:px-6 sm:py-12 lg:px-8">
@@ -320,3 +377,12 @@
 		</form>
 	</Dialog.Content>
 </Dialog.Root>
+
+<BrokerSettingsDialog
+	bind:open={brokerSettingsOpen}
+	activeUrl={activeBrokerUrl}
+	defaultUrl={defaultBrokerUrl}
+	{pageProtocol}
+	onSave={saveBrokerUrl}
+	onReset={resetBrokerUrl}
+/>
