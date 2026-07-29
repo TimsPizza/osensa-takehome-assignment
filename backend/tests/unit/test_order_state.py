@@ -16,6 +16,7 @@ from app.order_state import (
     ProcessingFailed,
     ProcessingStarted,
     PublishConfirmed,
+    QueueAdmissionFailed,
     RepublishRequested,
     RetryRequested,
     transition,
@@ -108,6 +109,16 @@ def test_failed_order_can_be_retried_from_the_queue() -> None:
     assert queued.failure_reason is None
 
 
+def test_queued_order_can_fail_when_queue_admission_is_rejected() -> None:
+    queued = OrderState(make_order())
+
+    failed = transition(queued, QueueAdmissionFailed("  processing queue is full  "))
+
+    assert failed.status is OrderStatus.FAILED
+    assert failed.failure_reason == "processing queue is full"
+    assert failed.food is None
+
+
 def test_published_food_can_be_scheduled_for_republish() -> None:
     published = published_state()
 
@@ -178,6 +189,16 @@ def test_empty_failure_reason_is_rejected_without_changing_current_state() -> No
 
     with pytest.raises(ValueError, match="failure reason"):
         transition(current, ProcessingFailed("   "))
+
+    assert current.status is OrderStatus.PROCESSING
+    assert current.failure_reason is None
+
+
+def test_queue_admission_failure_is_only_valid_while_queued() -> None:
+    current = processing_state()
+
+    with pytest.raises(InvalidOrderTransitionError):
+        transition(current, QueueAdmissionFailed("queue full"))
 
     assert current.status is OrderStatus.PROCESSING
     assert current.failure_reason is None
