@@ -59,3 +59,64 @@ export const OrderStatusChangedSchema = z.discriminatedUnion('status', [
 		.strict()
 ]);
 export type OrderStatusChanged = z.infer<typeof OrderStatusChangedSchema>;
+
+export const TableSnapshotSchema = z
+	.object({
+		schemaVersion: z.literal(1),
+		serviceInstanceId: z.string().uuid(),
+		tableId: z.number().int().gte(1).lte(4),
+		revision: z.number().int().gte(0),
+		generatedAt: z.string().datetime({ offset: true }),
+		orders: z
+			.array(
+				z.discriminatedUnion('status', [
+					z
+						.object({
+							schemaVersion: z.literal(1),
+							orderId: z.string().uuid(),
+							tableId: z.number().int().gte(1).lte(4),
+							foodName: z.string().regex(new RegExp('^\\S(?:.*\\S)?$')).min(1).max(100),
+							occurredAt: z.string().datetime({ offset: true }),
+							status: z.literal('queued')
+						})
+						.strict(),
+					z
+						.object({
+							schemaVersion: z.literal(1),
+							orderId: z.string().uuid(),
+							tableId: z.number().int().gte(1).lte(4),
+							foodName: z.string().regex(new RegExp('^\\S(?:.*\\S)?$')).min(1).max(100),
+							occurredAt: z.string().datetime({ offset: true }),
+							status: z.literal('processing')
+						})
+						.strict(),
+					z
+						.object({
+							schemaVersion: z.literal(1),
+							orderId: z.string().uuid(),
+							tableId: z.number().int().gte(1).lte(4),
+							foodName: z.string().regex(new RegExp('^\\S(?:.*\\S)?$')).min(1).max(100),
+							occurredAt: z.string().datetime({ offset: true }),
+							status: z.literal('food_ready'),
+							readyAt: z.string().datetime({ offset: true })
+						})
+						.strict(),
+					z
+						.object({
+							schemaVersion: z.literal(1),
+							orderId: z.string().uuid(),
+							tableId: z.number().int().gte(1).lte(4),
+							foodName: z.string().regex(new RegExp('^\\S(?:.*\\S)?$')).min(1).max(100),
+							occurredAt: z.string().datetime({ offset: true }),
+							status: z.literal('failed'),
+							code: z.enum(['processing_failed', 'service_overloaded']),
+							message: z.string().min(1).max(200),
+							retryable: z.boolean()
+						})
+						.strict()
+				])
+			)
+			.max(10)
+	})
+	.strict();
+export type TableSnapshot = z.infer<typeof TableSnapshotSchema>;

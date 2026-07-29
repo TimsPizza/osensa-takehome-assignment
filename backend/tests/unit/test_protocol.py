@@ -5,11 +5,14 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from app.models import FoodReady, OrderFailed
+from app.models import FoodReady, OrderFailed, TableSnapshot
 from app.protocol import (
     decode_order_requested,
     decode_order_status_changed,
+    decode_table_snapshot,
     encode_order_status_changed,
+    encode_table_snapshot,
+    table_snapshot_topic,
 )
 
 
@@ -86,3 +89,26 @@ def test_decode_failed_status_selects_the_discriminated_variant() -> None:
     assert update.order_id == order_id
     assert update.code == "service_overloaded"
     assert update.retryable is True
+
+
+def test_table_snapshot_round_trips_and_uses_a_table_scoped_topic() -> None:
+    service_instance_id = uuid4()
+    snapshot = TableSnapshot(
+        schemaVersion=1,
+        serviceInstanceId=service_instance_id,
+        tableId=2,
+        revision=3,
+        generatedAt=datetime(2026, 7, 28, 20, 15, 31, tzinfo=UTC),
+        orders=(),
+    )
+
+    decoded = decode_table_snapshot(encode_table_snapshot(snapshot))
+
+    assert decoded == snapshot
+    assert table_snapshot_topic(decoded.table_id) == "restaurant/v1/table/2/snapshot"
+
+
+@pytest.mark.parametrize("table_id", [0, 5])
+def test_table_snapshot_topic_rejects_an_unknown_table(table_id: int) -> None:
+    with pytest.raises(ValueError):
+        table_snapshot_topic(table_id)

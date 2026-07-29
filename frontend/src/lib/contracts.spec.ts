@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { OrderRequestedSchema, OrderStatusChangedSchema } from './generated/contracts';
+import {
+	OrderRequestedSchema,
+	OrderStatusChangedSchema,
+	TableSnapshotSchema
+} from './generated/contracts';
 
 const validOrder = {
 	schemaVersion: 1,
@@ -66,5 +70,35 @@ describe('generated MQTT contracts', () => {
 		}
 	])('rejects an invalid order status variant: %o', (update) => {
 		expect(OrderStatusChangedSchema.safeParse(update).success).toBe(false);
+	});
+
+	it('accepts a bounded table snapshot containing the status union', () => {
+		const snapshot = {
+			schemaVersion: 1,
+			serviceInstanceId: '1058bf2e-0ef0-4ae6-a3bc-267f1abbbd54',
+			tableId: 2,
+			revision: 4,
+			generatedAt: '2026-07-28T20:15:32Z',
+			orders: [{ ...validStatus, status: 'processing' }]
+		};
+
+		expect(TableSnapshotSchema.parse(snapshot)).toEqual(snapshot);
+	});
+
+	it('rejects a table snapshot with more than ten orders', () => {
+		const snapshot = {
+			schemaVersion: 1,
+			serviceInstanceId: '1058bf2e-0ef0-4ae6-a3bc-267f1abbbd54',
+			tableId: 2,
+			revision: 11,
+			generatedAt: '2026-07-28T20:15:32Z',
+			orders: Array.from({ length: 11 }, (_, index) => ({
+				...validStatus,
+				orderId: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+				status: 'queued'
+			}))
+		};
+
+		expect(TableSnapshotSchema.safeParse(snapshot).success).toBe(false);
 	});
 });

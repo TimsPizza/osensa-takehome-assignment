@@ -79,8 +79,18 @@ class OrderStatusChanged(RootModel[OrderStatusUpdate]):
     model_config = ConfigDict(frozen=True)
 
 
+class TableSnapshot(WireModel):
+    schema_version: Literal[1] = Field(alias="schemaVersion")
+    service_instance_id: UUID = Field(alias="serviceInstanceId")
+    table_id: int = Field(alias="tableId", strict=True, ge=1, le=4)
+    revision: int = Field(strict=True, ge=0)
+    generated_at: AwareDatetime = Field(alias="generatedAt")
+    orders: tuple[OrderStatusUpdate, ...] = Field(max_length=10)
+
+
 # Explicit roots prevent internal Pydantic models from leaking into the frontend contract.
 CODEGEN_TARGETS: Final[tuple[tuple[type[BaseModel], SchemaMode], ...]] = (
     (OrderRequested, "validation"),
     (OrderStatusChanged, "serialization"),
+    (TableSnapshot, "serialization"),
 )
