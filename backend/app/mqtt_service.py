@@ -31,7 +31,10 @@ from app.protocol import (
     ORDER_STATUS_CHANGED_TOPIC,
     decode_order_requested,
     encode_order_status_changed,
+    encode_table_snapshot,
+    table_snapshot_topic,
 )
+from app.table_projection import TableSnapshotProjection
 
 LOGGER = logging.getLogger(__name__)
 PROCESSING_FAILED_MESSAGE = "The order could not be prepared. Please retry."
@@ -70,6 +73,8 @@ class MqttOrderService:
             maxsize=(max_concurrent_orders + max_queued_orders) * 4,
         )
         self._pending_update: OrderStatusUpdate | None = None
+        self._table_projection = TableSnapshotProjection()
+        self._snapshots_initialized = False
 
     def _client(self) -> aiomqtt.Client:
         return aiomqtt.Client(
@@ -105,6 +110,8 @@ class MqttOrderService:
         while True:
             try:
                 async with self._client() as client:
+                    if not self._snapshots_initialized:
+                        await self._initialize_table_snapshots(client)
                     await client.subscribe(ORDER_REQUESTED_TOPIC, qos=MQTT_QOS)
                     reconnect_delay = self._settings.reconnect_delay_seconds
                     LOGGER.info(
@@ -129,6 +136,24 @@ class MqttOrderService:
                 reconnect_delay * 2,
                 self._settings.reconnect_max_delay_seconds,
             )
+
+    async def _initialize_table_snapshots(self, client: aiomqtt.Client) -> None:
+        snapshots = self._table_projection.initialize(self._clock())
+        for snapshot in snapshots:
+            topic = table_snapshot_topic(snapshot.table_id)
+            await client.publish(
+                topic,
+                payload=encode_table_snapshot(snapshot),
+                qos=MQTT_QOS,
+                retain=True,
+            )
+            LOGGER.info(
+                "table_snapshot_initialized table_id=%d topic=%s revision=%d",
+                snapshot.table_id,
+                topic,
+                snapshot.revision,
+            )
+        self._snapshots_initialized = True
 
     async def _run_connected(self, client: aiomqtt.Client) -> None:
         connection_tasks = {
@@ -360,6 +385,17 @@ class MqttOrderService:
                 qos=MQTT_QOS,
                 retain=False,
             )
+            snapshot = self._table_projection.apply(
+                update,
+                generated_at=self._clock(),
+            )
+            snapshot_topic = table_snapshot_topic(update.table_id)
+            await client.publish(
+                snapshot_topic,
+                payload=encode_table_snapshot(snapshot),
+                qos=MQTT_QOS,
+                retain=True,
+            )
 
             internal_status = update.status
             if isinstance(update, FoodReady):
@@ -371,10 +407,13 @@ class MqttOrderService:
 
             LOGGER.info(
                 "order_status_published order_id=%s table_id=%d topic=%s "
-                "public_status=%s internal_status=%s",
+                "snapshot_topic=%s snapshot_revision=%d public_status=%s "
+                "internal_status=%s",
                 update.order_id,
                 update.table_id,
                 ORDER_STATUS_CHANGED_TOPIC,
+                snapshot_topic,
+                snapshot.revision,
                 update.status,
                 internal_status,
             )

@@ -21,6 +21,8 @@ from app.protocol import (
     ORDER_REQUESTED_TOPIC,
     ORDER_STATUS_CHANGED_TOPIC,
     decode_order_status_changed,
+    decode_table_snapshot,
+    table_snapshot_topic,
 )
 
 FIRST_ORDER_ID = UUID("3b11d31c-7d34-4dda-91e5-d64721a50463")
@@ -437,7 +439,7 @@ async def test_publisher_emits_ordered_status_union_and_confirms_ready_food() ->
     assert ready_order is not None
     assert ready_order.status is OrderStatus.FOOD_READY
 
-    client = RecordingClient(expected_messages=3)
+    client = RecordingClient(expected_messages=6)
     publisher = asyncio.create_task(service._publish_status_updates(client))  # type: ignore[arg-type]
     try:
         await asyncio.wait_for(client.all_published.wait(), timeout=1)
@@ -445,8 +447,19 @@ async def test_publisher_emits_ordered_status_union_and_confirms_ready_food() ->
         publisher.cancel()
         await asyncio.gather(publisher, return_exceptions=True)
 
+    status_messages = [
+        message for message in client.published if message[0] == ORDER_STATUS_CHANGED_TOPIC
+    ]
+    snapshot_messages = [
+        message for message in client.published if message[0] == table_snapshot_topic(1)
+    ]
     updates = [
-        decode_order_status_changed(payload) for _topic, payload, _qos, _retain in client.published
+        decode_order_status_changed(payload)
+        for _topic, payload, _qos, _retain in status_messages
+    ]
+    snapshots = [
+        decode_table_snapshot(payload)
+        for _topic, payload, _qos, _retain in snapshot_messages
     ]
     published_order = service._registry.get(FIRST_ORDER_ID)
 
@@ -457,9 +470,44 @@ async def test_publisher_emits_ordered_status_union_and_confirms_ready_food() ->
     ]
     assert all(
         topic == ORDER_STATUS_CHANGED_TOPIC and qos == MQTT_QOS and retain is False
-        for topic, _payload, qos, retain in client.published
+        for topic, _payload, qos, retain in status_messages
+    )
+    assert [snapshot.revision for snapshot in snapshots] == [1, 2, 3]
+    assert [snapshot.orders[0].status for snapshot in snapshots] == [
+        "queued",
+        "processing",
+        "food_ready",
+    ]
+    assert all(
+        topic == table_snapshot_topic(1) and qos == MQTT_QOS and retain is True
+        for topic, _payload, qos, retain in snapshot_messages
     )
     assert published_order is not None
     assert published_order.status is OrderStatus.PUBLISHED
     assert service._status_updates.empty()
     assert service._pending_update is None
+
+
+async def test_service_initializes_four_retained_empty_table_snapshots() -> None:
+    service = MqttOrderService(make_settings())
+    client = RecordingClient(expected_messages=4)
+
+    await service._initialize_table_snapshots(client)  # type: ignore[arg-type]
+
+    snapshots = [
+        decode_table_snapshot(payload)
+        for _topic, payload, _qos, _retain in client.published
+    ]
+    assert [snapshot.table_id for snapshot in snapshots] == [1, 2, 3, 4]
+    assert all(snapshot.revision == 0 and snapshot.orders == () for snapshot in snapshots)
+    assert all(
+        topic == table_snapshot_topic(snapshot.table_id)
+        and qos == MQTT_QOS
+        and retain is True
+        for snapshot, (topic, _payload, qos, retain) in zip(
+            snapshots,
+            client.published,
+            strict=True,
+        )
+    )
+    assert service._snapshots_initialized is True
