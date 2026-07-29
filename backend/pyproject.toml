@@ -23,6 +23,7 @@ asyncio_mode = "auto"
 pythonpath = ["."]
 markers = [
     "integration: requires the local Mosquitto WebSocket Compose stack",
+    "load: opt-in MQTT burst and saturation tests",
 ]
 
 [tool.ruff]

@@ -1,6 +1,9 @@
 import asyncio
 import json
 import os
+from collections import Counter
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -24,12 +27,35 @@ pytestmark = [
 ]
 
 SUBSCRIPTION_COUNT_TOPIC = "$SYS/broker/subscriptions/count"
+LOAD_TEST = pytest.mark.skipif(
+    os.getenv("RUN_MQTT_LOAD") != "1",
+    reason="set RUN_MQTT_LOAD=1 to run MQTT burst tests",
+)
 
 
 @dataclass(frozen=True, slots=True)
 class ExpectedFood:
     table_id: int
     food_name: str
+
+
+def order_payload(
+    *,
+    order_id: str,
+    table_id: object = 1,
+    food_name: object = "Soup",
+    schema_version: object = 1,
+    **extra: object,
+) -> bytes:
+    return json.dumps(
+        {
+            "schemaVersion": schema_version,
+            "orderId": order_id,
+            "tableId": table_id,
+            "foodName": food_name,
+            **extra,
+        }
+    ).encode()
 
 
 async def wait_until_backend_is_subscribed(client: aiomqtt.Client) -> None:
@@ -39,6 +65,39 @@ async def wait_until_backend_is_subscribed(client: aiomqtt.Client) -> None:
         if int(message.payload) >= 3:
             return
     raise AssertionError("MQTT message stream ended before the backend subscribed")
+
+
+@asynccontextmanager
+async def connected_client(
+    *,
+    max_outgoing_calls: int = 10,
+) -> AsyncIterator[aiomqtt.Client]:
+    host = os.getenv("MQTT_TEST_HOST", "localhost")
+    port = int(os.getenv("MQTT_TEST_PORT", "9001"))
+    websocket_path = os.getenv("MQTT_TEST_WEBSOCKET_PATH", "/mqtt")
+
+    async with aiomqtt.Client(
+        hostname=host,
+        port=port,
+        identifier=f"integration-test-{uuid4()}",
+        clean_session=True,
+        transport="websockets",
+        websocket_path=websocket_path,
+        max_concurrent_outgoing_calls=max_outgoing_calls,
+    ) as client:
+        await client.subscribe(ORDER_STATUS_CHANGED_TOPIC, qos=MQTT_QOS)
+        await client.subscribe(SUBSCRIPTION_COUNT_TOPIC, qos=0)
+        await wait_until_backend_is_subscribed(client)
+        yield client
+
+
+async def publish_payload(client: aiomqtt.Client, payload: bytes) -> None:
+    await client.publish(
+        ORDER_REQUESTED_TOPIC,
+        payload=payload,
+        qos=MQTT_QOS,
+        retain=False,
+    )
 
 
 async def wait_for_food(
@@ -70,10 +129,29 @@ async def wait_for_food(
     raise AssertionError("MQTT message stream ended before all FOOD_READY events arrived")
 
 
+async def wait_for_one_food(
+    client: aiomqtt.Client,
+    order_id: str,
+) -> tuple[FoodReady, list[str]]:
+    statuses: list[str] = []
+
+    async for message in client.messages:
+        if str(message.topic) != ORDER_STATUS_CHANGED_TOPIC:
+            continue
+        update = decode_order_status_changed(message.payload)
+        if str(update.order_id) != order_id:
+            continue
+
+        statuses.append(update.status)
+        if isinstance(update, OrderFailed):
+            raise AssertionError(f"order {order_id} failed: {update.code}")
+        if isinstance(update, FoodReady):
+            return update, statuses
+
+    raise AssertionError(f"MQTT message stream ended before order {order_id} was ready")
+
+
 async def test_concurrent_orders_round_trip_over_websockets() -> None:
-    host = os.getenv("MQTT_TEST_HOST", "localhost")
-    port = int(os.getenv("MQTT_TEST_PORT", "9001"))
-    websocket_path = os.getenv("MQTT_TEST_WEBSOCKET_PATH", "/mqtt")
     expected = {
         str(uuid4()): ExpectedFood(table_id=1, food_name="Noodles"),
         str(uuid4()): ExpectedFood(table_id=2, food_name="Pizza"),
@@ -82,35 +160,16 @@ async def test_concurrent_orders_round_trip_over_websockets() -> None:
     }
 
     async with asyncio.timeout(15):
-        async with aiomqtt.Client(
-            hostname=host,
-            port=port,
-            identifier=f"integration-test-{uuid4()}",
-            clean_session=True,
-            transport="websockets",
-            websocket_path=websocket_path,
-        ) as client:
-            await client.subscribe(ORDER_STATUS_CHANGED_TOPIC, qos=MQTT_QOS)
-            await client.subscribe(SUBSCRIPTION_COUNT_TOPIC, qos=0)
-            await wait_until_backend_is_subscribed(client)
-
+        async with connected_client() as client:
             for order_id, expected_food in expected.items():
                 order = OrderRequested.model_validate_json(
-                    json.dumps(
-                        {
-                            "schemaVersion": 1,
-                            "orderId": order_id,
-                            "tableId": expected_food.table_id,
-                            "foodName": expected_food.food_name,
-                        }
+                    order_payload(
+                        order_id=order_id,
+                        table_id=expected_food.table_id,
+                        food_name=expected_food.food_name,
                     )
                 )
-                await client.publish(
-                    ORDER_REQUESTED_TOPIC,
-                    payload=order.model_dump_json().encode(),
-                    qos=MQTT_QOS,
-                    retain=False,
-                )
+                await publish_payload(client, order.model_dump_json().encode())
 
             received, statuses = await wait_for_food(client, set(expected))
 
@@ -123,3 +182,222 @@ async def test_concurrent_orders_round_trip_over_websockets() -> None:
         assert message.qos == MQTT_QOS
         assert message.retain is False
         assert statuses[order_id] == ["queued", "processing", "food_ready"]
+
+
+async def test_malformed_and_invalid_orders_are_rejected_without_poisoning_flow() -> None:
+    invalid_ids = [str(uuid4()) for _ in range(14)]
+    malformed_payloads = [
+        b"",
+        b"not-json",
+        b"\xff",
+        b"null",
+        b"[]",
+        b"{}",
+        order_payload(order_id="not-a-uuid"),
+        order_payload(order_id=invalid_ids[0], schema_version=2),
+        order_payload(order_id=invalid_ids[1], schema_version="1"),
+        order_payload(order_id=invalid_ids[2], table_id=0),
+        order_payload(order_id=invalid_ids[3], table_id=5),
+        order_payload(order_id=invalid_ids[4], table_id="2"),
+        order_payload(order_id=invalid_ids[5], table_id=True),
+        order_payload(order_id=invalid_ids[6], table_id=2.0),
+        order_payload(order_id=invalid_ids[7], food_name=""),
+        order_payload(order_id=invalid_ids[8], food_name="   "),
+        order_payload(order_id=invalid_ids[9], food_name=" leading"),
+        order_payload(order_id=invalid_ids[10], food_name="trailing "),
+        order_payload(order_id=invalid_ids[11], food_name="x" * 101),
+        order_payload(order_id=invalid_ids[12], unexpected=True),
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "orderId": invalid_ids[13],
+                "tableId": 1,
+            }
+        ).encode(),
+    ]
+    sentinel_id = str(uuid4())
+
+    async with asyncio.timeout(15):
+        async with connected_client(max_outgoing_calls=32) as client:
+            await asyncio.gather(
+                *(publish_payload(client, payload) for payload in malformed_payloads)
+            )
+            await publish_payload(
+                client,
+                order_payload(
+                    order_id=sentinel_id,
+                    table_id=4,
+                    food_name="Sentinel soup",
+                ),
+            )
+
+            invalid_updates = []
+            sentinel_statuses = []
+            async for message in client.messages:
+                if str(message.topic) != ORDER_STATUS_CHANGED_TOPIC:
+                    continue
+                update = decode_order_status_changed(message.payload)
+                update_order_id = str(update.order_id)
+                if update_order_id in invalid_ids:
+                    invalid_updates.append(update)
+                if update_order_id != sentinel_id:
+                    continue
+                sentinel_statuses.append(update.status)
+                if isinstance(update, FoodReady):
+                    break
+
+    assert invalid_updates == []
+    assert sentinel_statuses == ["queued", "processing", "food_ready"]
+
+
+async def test_duplicate_order_is_processed_once_then_republished_from_cache() -> None:
+    order_id = str(uuid4())
+    payload = order_payload(order_id=order_id, table_id=2, food_name="Duplicate pizza")
+
+    async with asyncio.timeout(20):
+        async with connected_client(max_outgoing_calls=32) as client:
+            await asyncio.gather(*(publish_payload(client, payload) for _ in range(20)))
+            first_food, first_statuses = await wait_for_one_food(client, order_id)
+
+            await publish_payload(client, payload)
+            republished_food, republished_statuses = await wait_for_one_food(client, order_id)
+
+    assert first_statuses == ["queued", "processing", "food_ready"]
+    assert republished_statuses == ["food_ready"]
+    assert republished_food.ready_at == first_food.ready_at
+    assert republished_food.occurred_at == first_food.occurred_at
+
+
+async def test_conflicting_payload_never_mutates_the_original_order() -> None:
+    order_id = str(uuid4())
+    original = order_payload(order_id=order_id, table_id=1, food_name="Original soup")
+    conflicting = order_payload(order_id=order_id, table_id=4, food_name="Conflicting tacos")
+    sentinel_id = str(uuid4())
+
+    async with asyncio.timeout(25):
+        async with connected_client() as client:
+            await publish_payload(client, original)
+            await publish_payload(client, conflicting)
+            food, statuses = await wait_for_one_food(client, order_id)
+
+            await publish_payload(client, conflicting)
+            await publish_payload(
+                client,
+                order_payload(
+                    order_id=sentinel_id,
+                    table_id=3,
+                    food_name="Conflict sentinel",
+                ),
+            )
+
+            unexpected_original_updates = []
+            sentinel_statuses = []
+            async for message in client.messages:
+                if str(message.topic) != ORDER_STATUS_CHANGED_TOPIC:
+                    continue
+                update = decode_order_status_changed(message.payload)
+                update_order_id = str(update.order_id)
+                if update_order_id == order_id:
+                    unexpected_original_updates.append(update)
+                if update_order_id != sentinel_id:
+                    continue
+                sentinel_statuses.append(update.status)
+                if isinstance(update, FoodReady):
+                    break
+
+    assert food.table_id == 1
+    assert food.food_name == "Original soup"
+    assert statuses == ["queued", "processing", "food_ready"]
+    assert unexpected_original_updates == []
+    assert sentinel_statuses == ["queued", "processing", "food_ready"]
+
+
+@pytest.mark.load
+@LOAD_TEST
+async def test_hundred_order_burst_reaches_unique_terminal_states() -> None:
+    expected = {
+        str(uuid4()): ExpectedFood(
+            table_id=(index % 4) + 1,
+            food_name=f"Load order {index:03d}",
+        )
+        for index in range(100)
+    }
+
+    async with asyncio.timeout(90):
+        async with connected_client(max_outgoing_calls=128) as client:
+            await asyncio.gather(
+                *(
+                    publish_payload(
+                        client,
+                        order_payload(
+                            order_id=order_id,
+                            table_id=food.table_id,
+                            food_name=food.food_name,
+                        ),
+                    )
+                    for order_id, food in expected.items()
+                )
+            )
+            received, statuses = await wait_for_food(client, set(expected))
+
+    assert received.keys() == expected.keys()
+    assert all(
+        statuses[order_id] == ["queued", "processing", "food_ready"] for order_id in expected
+    )
+    assert {
+        order_id
+        for order_id, (food, _message) in received.items()
+        if food.table_id == expected[order_id].table_id
+        and food.food_name == expected[order_id].food_name
+    } == set(expected)
+
+
+@pytest.mark.load
+@LOAD_TEST
+async def test_saturated_burst_reports_explicit_admission_failures() -> None:
+    worker_count = 8
+    queue_capacity = 256
+    rejected_count = 16
+    order_ids = [str(uuid4()) for _ in range(worker_count + queue_capacity + rejected_count)]
+
+    async with asyncio.timeout(30):
+        async with connected_client(max_outgoing_calls=320) as client:
+            await asyncio.gather(
+                *(
+                    publish_payload(
+                        client,
+                        order_payload(
+                            order_id=order_id,
+                            table_id=(index % 4) + 1,
+                            food_name=f"Saturation order {index:03d}",
+                        ),
+                    )
+                    for index, order_id in enumerate(order_ids)
+                )
+            )
+
+            admissions: dict[str, str] = {}
+            failures: dict[str, OrderFailed] = {}
+            async for message in client.messages:
+                if str(message.topic) != ORDER_STATUS_CHANGED_TOPIC:
+                    continue
+                update = decode_order_status_changed(message.payload)
+                update_order_id = str(update.order_id)
+                if update_order_id not in order_ids or update_order_id in admissions:
+                    continue
+                if update.status == "queued":
+                    admissions[update_order_id] = update.status
+                elif isinstance(update, OrderFailed):
+                    admissions[update_order_id] = update.status
+                    failures[update_order_id] = update
+                if len(admissions) == len(order_ids):
+                    break
+
+    assert Counter(admissions.values()) == {
+        "queued": worker_count + queue_capacity,
+        "failed": rejected_count,
+    }
+    assert len(failures) == rejected_count
+    assert all(
+        failure.code == "service_overloaded" and failure.retryable for failure in failures.values()
+    )
