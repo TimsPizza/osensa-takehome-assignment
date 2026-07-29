@@ -7,6 +7,7 @@ from uuid import UUID
 from app.config import Settings
 from app.models import FoodReady, OrderRequested
 from app.mqtt_service import MqttOrderService
+from app.order_state import OrderStatus
 from app.protocol import ORDER_REQUESTED_TOPIC
 
 FIRST_ORDER_ID = UUID("3b11d31c-7d34-4dda-91e5-d64721a50463")
@@ -92,11 +93,14 @@ async def test_orders_run_concurrently_with_bounded_backpressure() -> None:
 
     processor.release.set()
     await asyncio.wait_for(third_order, timeout=1)
-    ready_food = [await asyncio.wait_for(service._ready_food.get(), timeout=1) for _ in range(3)]
+    ready_orders = [
+        await asyncio.wait_for(service._ready_orders.get(), timeout=1) for _ in range(3)
+    ]
     await asyncio.gather(*tuple(service._processing_tasks))
 
     assert processor.max_active == 2
-    assert {food.order_id for food in ready_food} == {
+    assert all(order.status is OrderStatus.FOOD_READY for order in ready_orders)
+    assert {order.food.order_id for order in ready_orders if order.food is not None} == {
         FIRST_ORDER_ID,
         SECOND_ORDER_ID,
         THIRD_ORDER_ID,

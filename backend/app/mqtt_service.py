@@ -8,6 +8,14 @@ from pydantic import ValidationError
 from app.config import Settings
 from app.models import FoodReady, OrderRequested
 from app.order_processor import OrderProcessor
+from app.order_state import (
+    FoodPrepared,
+    OrderState,
+    ProcessingFailed,
+    ProcessingStarted,
+    PublishConfirmed,
+    transition,
+)
 from app.protocol import (
     FOOD_READY_TOPIC,
     MQTT_QOS,
@@ -38,10 +46,10 @@ class MqttOrderService:
         self._processor = processor if processor is not None else OrderProcessor()
         self._processing_slots = asyncio.Semaphore(max_concurrent_orders)
         self._processing_tasks: set[asyncio.Task[None]] = set()
-        self._ready_food: asyncio.Queue[FoodReady] = asyncio.Queue(
+        self._ready_orders: asyncio.Queue[OrderState] = asyncio.Queue(
             maxsize=max_concurrent_orders,
         )
-        self._pending_food: FoodReady | None = None
+        self._pending_order: OrderState | None = None
 
     def _client(self) -> aiomqtt.Client:
         return aiomqtt.Client(
@@ -139,58 +147,80 @@ class MqttOrderService:
             order.table_id,
         )
 
+        queued_order = OrderState(order)
         await self._processing_slots.acquire()
         task = asyncio.create_task(
-            self._process_order(order),
+            self._process_order(queued_order),
             name=f"order-{order.order_id}",
         )
         self._processing_tasks.add(task)
         task.add_done_callback(self._processing_tasks.discard)
 
-    async def _process_order(self, order: OrderRequested) -> None:
+    async def _process_order(self, queued_order: OrderState) -> None:
+        processing_order = transition(queued_order, ProcessingStarted())
+        order = processing_order.order
+
         try:
             LOGGER.info(
-                "order_processing_started order_id=%s table_id=%d",
+                "order_processing_started order_id=%s table_id=%d status=%s",
                 order.order_id,
                 order.table_id,
+                processing_order.status,
             )
             food = await self._processor.process(order)
-            await self._ready_food.put(food)
+            ready_order = transition(processing_order, FoodPrepared(food))
+            await self._ready_orders.put(ready_order)
             LOGGER.info(
-                "order_processing_finished order_id=%s table_id=%d",
+                "order_processing_finished order_id=%s table_id=%d status=%s",
                 food.order_id,
                 food.table_id,
+                ready_order.status,
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
+            failure_reason = f"{type(error).__name__}: {error}"
+            failed_order = transition(
+                processing_order,
+                ProcessingFailed(failure_reason),
+            )
             LOGGER.exception(
-                "order_processing_failed order_id=%s table_id=%d",
+                "order_processing_failed order_id=%s table_id=%d status=%s reason=%s",
                 order.order_id,
                 order.table_id,
+                failed_order.status,
+                failed_order.failure_reason,
             )
         finally:
             self._processing_slots.release()
 
     async def _publish_ready_food(self, client: aiomqtt.Client) -> None:
         while True:
-            if self._pending_food is None:
-                self._pending_food = await self._ready_food.get()
+            if self._pending_order is None:
+                self._pending_order = await self._ready_orders.get()
 
-            food = self._pending_food
+            ready_order = self._pending_order
+            food = ready_order.food
+            if food is None:
+                raise RuntimeError(
+                    f"{ready_order.status} order {ready_order.order.order_id} has no food"
+                )
+
             await client.publish(
                 FOOD_READY_TOPIC,
                 payload=encode_food_ready(food),
                 qos=MQTT_QOS,
                 retain=False,
             )
+            published_order = transition(ready_order, PublishConfirmed())
             LOGGER.info(
-                "food_published order_id=%s table_id=%d topic=%s",
+                "food_published order_id=%s table_id=%d topic=%s status=%s",
                 food.order_id,
                 food.table_id,
                 FOOD_READY_TOPIC,
+                published_order.status,
             )
-            self._pending_food = None
+            self._pending_order = None
 
     async def _cancel_processing_tasks(self) -> None:
         tasks = tuple(self._processing_tasks)
