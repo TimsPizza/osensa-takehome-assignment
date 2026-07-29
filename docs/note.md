@@ -26,3 +26,5 @@
 
 
 21. now test for pub net deployment, will be vercel + OCI VPS.
+22. just noticed there's no ACL config. Better configure for each table, plus the backend, and the webui
+23.

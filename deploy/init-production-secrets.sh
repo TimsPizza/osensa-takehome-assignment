@@ -7,6 +7,8 @@ password_file="$secrets_directory/mosquitto-passwords"
 image="eclipse-mosquitto:2.1.2-alpine"
 users="restaurant-backend restaurant-console table-1 table-2 table-3 table-4"
 
+chmod 700 "$secrets_directory"
+
 for user in $users; do
 	secret_path="$secrets_directory/mqtt-${user}-password"
 	if [ -e "$secret_path" ] || [ -e "$password_file" ]; then
@@ -44,6 +46,12 @@ for user in $users; do
 done
 
 chmod 600 "$temporary_directory"/mqtt-*-password "$temporary_password_file"
+# File-backed Compose secrets retain their host permissions. These two files
+# must be readable by the non-root Mosquitto and backend container users. The
+# parent secrets directory remains mode 0700 on the host.
+chmod 644 \
+	"$temporary_password_file" \
+	"$temporary_directory/mqtt-restaurant-backend-password"
 for generated_file in "$temporary_directory"/*; do
 	mv "$generated_file" "$secrets_directory/"
 done

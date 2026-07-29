@@ -31,7 +31,9 @@ Generate unique credentials and the hashed Mosquitto password file:
 ```
 
 The initializer refuses to overwrite existing credentials. Secret files stay
-under `deploy/secrets/` and are excluded from Git.
+under `deploy/secrets/` and are excluded from Git. On native Linux, the
+directory remains accessible only to its owner; the two files mounted into
+non-root containers are read-only mounts with host-readable file modes.
 
 ## Deploy
 
