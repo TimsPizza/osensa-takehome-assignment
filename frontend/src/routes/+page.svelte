@@ -5,6 +5,9 @@
 	import { onMount } from 'svelte';
 	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
+	import { BoundaryTestController } from '$lib/boundary-test-controller';
+	import AppSidebar, { type AppPanel } from '$lib/components/app-sidebar.svelte';
+	import BoundaryLab from '$lib/components/boundary-lab.svelte';
 	import KitchenPressure from '$lib/components/kitchen-pressure.svelte';
 	import TableCard from '$lib/components/table-card.svelte';
 	import { Badge } from '$lib/components/ui/badge';
@@ -37,9 +40,16 @@
 	let foodName = $state('');
 	let formError = $state('');
 	let submitting = $state(false);
+	let activePanel = $state<AppPanel>('restaurant');
 	const bulkOrderingTables = new SvelteSet<TableId>();
 	const snapshotCursors = new SvelteMap<TableId, TableSnapshotCursor>();
 	let mqttClient: RestaurantMqttClient | undefined;
+	const boundaryTests = new BoundaryTestController(async (order) => {
+		if (!mqttClient || connectionState !== 'connected') {
+			throw new Error('MQTT client is not ready');
+		}
+		await mqttClient.publishOrder(order);
+	});
 
 	const connected = $derived(connectionState === 'connected');
 	const connectionCopy = $derived.by(() => {
@@ -66,6 +76,7 @@
 			},
 			onOrderStatus: (status) => {
 				orders = applyOrderStatus(orders, status);
+				boundaryTests.handleOrderStatus(status);
 			},
 			onTableSnapshot: (snapshot) => {
 				const tableId = snapshot.tableId as TableId;
@@ -85,6 +96,7 @@
 					snapshot.revision > kitchenPressure.revision
 				) {
 					kitchenPressure = snapshot;
+					boundaryTests.handlePressure(snapshot);
 				}
 			},
 			onError: (message) => {
@@ -94,6 +106,7 @@
 		mqttClient.connect();
 
 		return () => {
+			boundaryTests.destroy();
 			void mqttClient?.disconnect();
 		};
 	});
@@ -184,71 +197,85 @@
 	/>
 </svelte:head>
 
-<main class="min-h-screen bg-[linear-gradient(180deg,#fafaf9_0%,#f5f5f4_55%,#ede9e3_100%)]">
-	<div class="mx-auto max-w-7xl px-4 py-8 sm:px-6 sm:py-12 lg:px-8">
-		<header class="mb-8 flex flex-col gap-6 sm:mb-10 sm:flex-row sm:items-end sm:justify-between">
-			<div class="max-w-2xl">
-				<div class="mb-4 flex items-center gap-2 text-sm font-semibold text-amber-800">
-					<span class="flex size-8 items-center justify-center rounded-full bg-amber-100">
-						<UtensilsIcon class="size-4" />
-					</span>
-					OSENSA Restaurant
+<div class="min-h-screen bg-[linear-gradient(180deg,#fafaf9_0%,#f5f5f4_55%,#ede9e3_100%)]">
+	<AppSidebar {activePanel} {connectionState} onNavigate={(panel) => (activePanel = panel)} />
+
+	<main class="lg:pl-72">
+		<div class="mx-auto max-w-[96rem] px-4 py-8 sm:px-6 sm:py-12 lg:px-8">
+			<header class="mb-8 flex flex-col gap-6 sm:mb-10 sm:flex-row sm:items-end sm:justify-between">
+				<div class="max-w-3xl">
+					<div class="mb-4 flex items-center gap-2 text-sm font-semibold text-amber-800">
+						<span class="flex size-8 items-center justify-center rounded-full bg-amber-100">
+							<UtensilsIcon class="size-4" />
+						</span>
+						{activePanel === 'restaurant' ? 'OSENSA Restaurant' : 'OSENSA Boundary Lab'}
+					</div>
+					<h1 class="text-4xl font-semibold tracking-[-0.04em] text-stone-950 sm:text-5xl">
+						{activePanel === 'restaurant' ? 'What can we make for you?' : 'Prove the boundaries.'}
+					</h1>
+					<p class="mt-3 max-w-2xl text-base leading-7 text-stone-600">
+						{activePanel === 'restaurant'
+							? 'Choose your table, place an order, and watch it move through the kitchen in real time.'
+							: 'Drive bursts, duplicate delivery, and sustained load through the same production MQTT contract.'}
+					</p>
 				</div>
-				<h1 class="text-4xl font-semibold tracking-[-0.04em] text-stone-950 sm:text-5xl">
-					What can we make for you?
-				</h1>
-				<p class="mt-3 max-w-xl text-base leading-7 text-stone-600">
-					Choose your table, place an order, and watch it move through the kitchen in real time.
-				</p>
-			</div>
 
-			<Badge
-				variant={connected ? 'outline' : 'secondary'}
-				class={connected
-					? 'border-emerald-200 bg-emerald-50 px-3 py-2 text-emerald-800'
-					: 'px-3 py-2 text-stone-600'}
-			>
-				<span
-					class={`size-2 rounded-full ${connected ? 'bg-emerald-500' : 'animate-pulse bg-amber-500'}`}
-				></span>
-				{connectionCopy}
-			</Badge>
-		</header>
+				<Badge
+					variant={connected ? 'outline' : 'secondary'}
+					class={connected
+						? 'border-emerald-200 bg-emerald-50 px-3 py-2 text-emerald-800'
+						: 'px-3 py-2 text-stone-600'}
+				>
+					<span
+						class={`size-2 rounded-full ${connected ? 'bg-emerald-500' : 'animate-pulse bg-amber-500'}`}
+					></span>
+					{connectionCopy}
+				</Badge>
+			</header>
 
-		{#if connectionError}
-			<div
-				class="mb-6 flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800"
-				role="status"
-			>
-				<CircleAlertIcon class="mt-0.5 size-4 shrink-0" />
-				<div>
-					<p class="font-medium">{connectionError}</p>
-					<p class="mt-0.5 text-red-700">Orders are paused while we reconnect automatically.</p>
+			{#if connectionError}
+				<div
+					class="mb-6 flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800"
+					role="status"
+				>
+					<CircleAlertIcon class="mt-0.5 size-4 shrink-0" />
+					<div>
+						<p class="font-medium">{connectionError}</p>
+						<p class="mt-0.5 text-red-700">Orders are paused while we reconnect automatically.</p>
+					</div>
 				</div>
-			</div>
-		{/if}
+			{/if}
 
-		<KitchenPressure snapshot={kitchenPressure} {connected} />
+			{#if activePanel === 'restaurant'}
+				<section class="grid gap-5 md:grid-cols-2 xl:grid-cols-4" aria-label="Restaurant tables">
+					{#each tables as tableId (tableId)}
+						<TableCard
+							{tableId}
+							orders={ordersForTable(tableId)}
+							{connected}
+							bulkOrdering={bulkOrderingTables.has(tableId)}
+							onOrder={openOrderDialog}
+							onBulkOrder={placeRandomOrders}
+						/>
+					{/each}
+				</section>
+			{:else}
+				<section aria-label="System boundary tests">
+					<BoundaryLab controller={boundaryTests} {connected} />
+				</section>
+			{/if}
 
-		<section class="grid gap-5 md:grid-cols-2 xl:grid-cols-4" aria-label="Restaurant tables">
-			{#each tables as tableId (tableId)}
-				<TableCard
-					{tableId}
-					orders={ordersForTable(tableId)}
-					{connected}
-					bulkOrdering={bulkOrderingTables.has(tableId)}
-					onOrder={openOrderDialog}
-					onBulkOrder={placeRandomOrders}
-				/>
-			{/each}
-		</section>
+			<footer
+				class="mt-8 flex items-center justify-center gap-2 text-center text-xs text-stone-500"
+			>
+				<RadioIcon class="size-3.5" />
+				One live MQTT WebSocket connection powers both panels
+			</footer>
+		</div>
+	</main>
 
-		<footer class="mt-8 flex items-center justify-center gap-2 text-center text-xs text-stone-500">
-			<RadioIcon class="size-3.5" />
-			Live order updates over MQTT WebSockets
-		</footer>
-	</div>
-</main>
+	<KitchenPressure snapshot={kitchenPressure} {connected} />
+</div>
 
 <Dialog.Root bind:open={orderDialogOpen}>
 	<Dialog.Content>
