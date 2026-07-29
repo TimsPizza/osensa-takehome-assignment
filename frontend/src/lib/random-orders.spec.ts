@@ -18,7 +18,7 @@ describe('random order batch', () => {
 		expect(orders.every((order) => order.foodName === 'Margherita pizza')).toBe(true);
 	});
 
-	it.each([0, -1, 1.5, 101])('rejects an unsafe batch size: %s', (count) => {
+	it.each([0, -1, 1.5, 501])('rejects an unsafe batch size: %s', (count) => {
 		expect(() => createRandomOrders(1, { count })).toThrow(RangeError);
 	});
 });

@@ -32,8 +32,8 @@ export function createRandomOrders(
 		createId = () => crypto.randomUUID()
 	}: RandomOrderOptions = {}
 ): RandomOrder[] {
-	if (!Number.isInteger(count) || count < 1 || count > 100) {
-		throw new RangeError('count must be an integer between 1 and 100');
+	if (!Number.isInteger(count) || count < 1 || count > 500) {
+		throw new RangeError('count must be an integer between 1 and 500');
 	}
 
 	return Array.from({ length: count }, () => {
