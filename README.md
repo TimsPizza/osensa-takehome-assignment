@@ -21,7 +21,7 @@ events.
 - Local Docker Compose for zero-configuration WS testing.
 - A production deployment reference with authenticated Mosquitto, WSS termination,
   hardened containers, secrets, health checks, and log rotation.
-- Unit, contract, real-Broker integration, load, browser-MQTT, and ACL isolation tests.
+- Unit, contract, real-Broker integration, load, and browser-MQTT tests.
 
 ## Architecture
 
@@ -36,7 +36,7 @@ flowchart LR
     end
 
     CADDY["Caddy or existing ingress<br/>production WSS only"]
-    BROKER["Mosquitto<br/>MQTT over WebSockets<br/>QoS 1 + ACL"]
+    BROKER["Mosquitto<br/>MQTT over WebSockets<br/>QoS 1 + production ACL"]
 
     subgraph Backend["Python asyncio order service"]
         RECEIVE["Topic parser<br/>Pydantic validation"]
@@ -72,11 +72,13 @@ flowchart LR
 
 1. The browser validates an order with the generated Zod contract and publishes
    it to that table's request topic.
-2. Mosquitto applies the authenticated client's topic ACL before routing it.
+2. Mosquitto routes the message; in production it first applies the authenticated
+   client's topic ACL.
 3. The backend validates both the topic and payload, including that their table
    IDs agree.
 4. The idempotency registry decides whether to process, ignore, retry, republish,
-   reject a conflict, or reject new work at capacity.
+   defer a replay while `food_ready` publication is in flight, reject a conflict, or
+   reject new work at capacity.
 5. An admitted order enters a bounded `asyncio.Queue`. One fixed worker owns it
    until processing completes or fails.
 6. The state reducer authorizes every transition. Public status events are
@@ -113,8 +115,10 @@ stateDiagram-v2
     PUBLISHED --> FOOD_READY: identical request republished
 ```
 
-`PUBLISHED` is an internal delivery-confirmation state. The public protocol
-exposes `queued`, `processing`, `food_ready`, and `failed`.
+`PUBLISHED` is an internal Broker-publication-confirmation state: the backend
+has completed the QoS 1 publication sequence for `food_ready` and its retained
+snapshot. It does not claim that a browser subscriber has consumed the message.
+The public protocol exposes `queued`, `processing`, `food_ready`, and `failed`.
 
 The reducer returns a new immutable state for every valid transition and rejects
 invalid or repeated transitions. This keeps concurrency correctness independent
@@ -208,9 +212,9 @@ an implementation rather than treating "production ready" as a label.
 | Concern                 | Implementation                                                                                                                                                                                                                           |
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Concurrency             | A producer-consumer design separates MQTT intake from a fixed worker pool. Each admitted order is owned by one worker.                                                                                                                   |
-| Backpressure            | The processing queue, incoming MQTT queue, status queue, registry, snapshots, and Broker queues all have explicit bounds.                                                                                                                |
+| Backpressure            | The processing queue, incoming MQTT queue, status queue, registry, snapshots, and production Broker queues all have explicit bounds.                                                                                                     |
 | Overload                | Queue or registry exhaustion produces a structured `failed` event with code `service_overloaded` and `retryable: true`; rejected orders never become ghost work.                                                                         |
-| Delivery semantics      | MQTT QoS 1 provides at-least-once delivery. A table-scoped `(tableId, orderId)` registry makes duplicates safe and detects conflicting payload reuse.                                                                                    |
+| Delivery semantics      | MQTT QoS 1 provides at-least-once delivery on each connected MQTT hop. Retained snapshots recover state missed by disconnected browsers; a table-scoped `(tableId, orderId)` registry makes duplicates safe and detects conflicting payload reuse. |
 | State correctness       | A pure reducer enforces the immutable order state machine. Invalid transitions and mismatched food results fail without mutating the current state.                                                                                      |
 | Recovery                | Per-table retained snapshots restore the ten most recent orders after refresh or a closed browser session. Revisions reject stale snapshots; a service-instance ID distinguishes backend restarts.                                       |
 | Contract safety         | Strict Pydantic models reject unknown fields, wrong types, invalid UUIDs, untrimmed/oversized names, unsupported schema versions, and naive timestamps.                                                                                  |
@@ -220,7 +224,7 @@ an implementation rather than treating "production ready" as a label.
 | Logging                 | Backend logs use stable event names and key-value context including order, table, worker, state, queue depth, topic, and reconnect delay. Caddy emits JSON access logs.                                                                  |
 | Observability           | A retained pressure projection exposes queue depth, capacity, worker occupancy, revision, and service instance to the live UI.                                                                                                           |
 | Security                | Production disables anonymous access, uses hashed Broker passwords, enforces least-privilege topic ACLs, validates topic/payload agreement, terminates WSS, checks browser Origin, and uses HSTS.                                        |
-| Runtime hardening       | Production services use read-only filesystems where practical, non-root backend execution, `no-new-privileges`, memory/PID limits, health checks, restart policies, pinned images, and bounded log rotation.                             |
+| Runtime hardening       | Production services use read-only filesystems where practical, non-root backend execution, `no-new-privileges`, memory/PID limits, a Broker health check, restart policies, pinned images, and bounded log rotation.                     |
 | Documentation           | This README documents architecture, operation, security, verification, trade-offs, and explicit non-goals. Deployment details live in `deploy/README.md`.                                                                                |
 
 ### Backpressure and capacity
@@ -249,13 +253,14 @@ The automated suites cover, among other cases:
 - request-topic and payload-table mismatches;
 - concurrent orders across all four tables;
 - duplicate active, failed, completed, and republished orders;
+- duplicate completion requests arriving while `food_ready` publication is in flight,
+  including coalesced deferred replay;
 - the same UUID used independently by different tables;
 - conflicting payload reuse without mutation of the original order;
 - processor exceptions and cancellation;
 - full processing and registry queues;
 - ordered status publication and retained snapshot recovery;
 - stale, duplicate, regressive, and cross-table frontend updates;
-- anonymous login, invalid credentials, cross-table reads/writes, and forged status events;
 - hundred-order bursts, sustained overload, and post-rejection ghost-work detection.
 
 Malformed messages cannot always receive a response because their identity may
@@ -299,7 +304,7 @@ corepack pnpm test
 corepack pnpm build
 ```
 
-The current fast suites contain 125 passing backend tests and 63 passing
+The current fast suites contain 126 passing backend tests and 65 passing
 frontend tests. Broker-dependent suites are skipped unless explicitly enabled.
 
 ### Real MQTT round trip
@@ -330,10 +335,6 @@ corepack pnpm exec playwright install chromium
 VITE_RUN_MQTT_INTEGRATION=1 corepack pnpm test:mqtt
 ```
 
-The production ACL suite is in
-`backend/tests/integration/test_mqtt_acl.py`. It requires an authenticated
-production Broker and is opt-in with `RUN_MQTT_SECURITY=1`.
-
 ## Security model
 
 Development and production intentionally have different trust boundaries.
@@ -356,9 +357,10 @@ Development and production intentionally have different trust boundaries.
 - Broker and backend credentials are mounted as read-only file-backed secrets.
 - Mosquitto is not directly exposed to the public network.
 
-The WebUI Broker dialog uses the `restaurant-console` identity for the
-four-table demonstration. A customer-facing single-table terminal should use
-its corresponding `table-N` identity and should not expose the Boundary Lab.
+For the production four-table demonstration, enter the `restaurant-console`
+credentials in the WebUI Broker dialog. A customer-facing single-table terminal
+should use its corresponding `table-N` identity and should not expose the
+Boundary Lab.
 
 The default Docker Compose command is intentionally local WS only. Public WSS
 cannot be universally one-click because certificate issuance, DNS ownership,
@@ -427,13 +429,17 @@ and automated credential rotation.
 backend/
   app/                    asyncio service, contracts, state machine, projections
   tests/unit/             deterministic domain and service tests
-  tests/integration/      real MQTT flow, load, recovery, and ACL tests
+  tests/integration/      real MQTT flow, load, and recovery tests
 frontend/
   Dockerfile              multi-stage static UI image
   Caddyfile               loopback UI static server
   scripts/                Pydantic JSON Schema to Zod generator
   src/lib/generated/      committed generated MQTT contracts
-  src/lib/                MQTT client, reducers, Boundary Lab, UI components
+  src/lib/mqtt/           MQTT transport, protocol, and connection settings
+  src/lib/boundary-tests/ Boundary Lab scenario runners
+  src/lib/components/     restaurant, boundary, pressure, and settings UI
+  src/lib/restaurant-session.svelte.ts
+                          shared four-table session and MQTT state
 deploy/
   caddy/                  WSS ingress reference
   mosquitto/              development and production Broker policies
