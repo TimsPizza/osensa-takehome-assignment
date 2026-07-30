@@ -73,7 +73,6 @@ def test_new_order_is_registered_for_processing() -> None:
     [
         (),
         (ProcessingStarted(),),
-        (ProcessingStarted(), FoodPrepared(make_food())),
     ],
 )
 def test_duplicate_active_order_is_ignored(
@@ -91,6 +90,28 @@ def test_duplicate_active_order_is_ignored(
     assert result.state is current
     assert registry.get(2, ORDER_ID) is current
     assert len(registry) == 1
+
+
+def test_duplicate_ready_order_defers_cached_food_republish() -> None:
+    registry = OrderRegistry()
+    order = make_order()
+    registry.register(order)
+    apply_events(
+        registry,
+        (
+            ProcessingStarted(),
+            FoodPrepared(make_food()),
+        ),
+    )
+    ready = registry.get(2, ORDER_ID)
+
+    result = registry.register(order)
+
+    assert ready is not None
+    assert ready.status is OrderStatus.FOOD_READY
+    assert result.action is RegistrationAction.DEFER_REPUBLISH
+    assert result.state is ready
+    assert registry.get(2, ORDER_ID) is ready
 
 
 def test_duplicate_published_order_schedules_cached_food_for_republish() -> None:

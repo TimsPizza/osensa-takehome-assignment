@@ -137,6 +137,31 @@ class RecordingClient:
             self.all_published.set()
 
 
+class SnapshotGatedClient:
+    def __init__(self, table_id: int) -> None:
+        self._status_topic = order_status_changed_topic(table_id)
+        self.first_food_visible = asyncio.Event()
+        self.release_first_snapshot = asyncio.Event()
+        self.food_publish_count = 0
+
+    async def publish(
+        self,
+        topic: str,
+        payload: bytes,
+        qos: int,
+        retain: bool,
+    ) -> None:
+        del payload, qos
+
+        if topic == self._status_topic:
+            self.food_publish_count += 1
+            if self.food_publish_count == 1:
+                self.first_food_visible.set()
+
+        if retain and self.food_publish_count == 1:
+            await self.release_first_snapshot.wait()
+
+
 @asynccontextmanager
 async def running_workers(
     service: MqttOrderService,
@@ -310,6 +335,49 @@ async def test_duplicate_published_order_requeues_cached_food_without_processing
     service._status_updates.task_done()
     assert isinstance(update, FoodReady)
     assert update is food
+    assert processor.calls == 0
+
+
+async def test_duplicate_ready_orders_coalesce_into_one_republish_after_confirmation() -> None:
+    processor = GatedProcessor(expected_concurrency=1)
+    service = MqttOrderService(make_settings(), processor)
+    message = make_message(FIRST_ORDER_ID, 1)
+    order = OrderRequested.model_validate_json(message.payload)
+    food = FoodReady(
+        schemaVersion=1,
+        orderId=order.order_id,
+        tableId=order.table_id,
+        foodName=order.food_name,
+        status="food_ready",
+        occurredAt=READY_AT,
+        readyAt=READY_AT,
+    )
+    service._registry.register(order)
+    service._registry.apply(order.table_id, order.order_id, ProcessingStarted())
+    service._registry.apply(order.table_id, order.order_id, FoodPrepared(food))
+    service._queue_status_update(food)
+    client = SnapshotGatedClient(table_id=1)
+    publisher = asyncio.create_task(service._publish_status_updates(client))  # type: ignore[arg-type]
+
+    try:
+        await asyncio.wait_for(client.first_food_visible.wait(), timeout=1)
+        for _ in range(20):
+            await service._handle_message(message)
+
+        assert service._deferred_republishes == {(1, FIRST_ORDER_ID)}
+        assert client.food_publish_count == 1
+
+        client.release_first_snapshot.set()
+        await asyncio.wait_for(service._status_updates.join(), timeout=1)
+    finally:
+        publisher.cancel()
+        await asyncio.gather(publisher, return_exceptions=True)
+
+    published_order = service._registry.get(1, FIRST_ORDER_ID)
+    assert client.food_publish_count == 2
+    assert service._deferred_republishes == set()
+    assert published_order is not None
+    assert published_order.status is OrderStatus.PUBLISHED
     assert processor.calls == 0
 
 

@@ -19,6 +19,7 @@ type OrderKey = tuple[int, UUID]
 class RegistrationAction(StrEnum):
     PROCESS = "process"
     IGNORE = "ignore"
+    DEFER_REPUBLISH = "defer_republish"
     REPUBLISH = "republish"
     CONFLICT = "conflict"
 
@@ -65,8 +66,11 @@ class OrderRegistry:
             return RegistrationResult(RegistrationAction.CONFLICT, current)
 
         match current.status:
-            case OrderStatus.QUEUED | OrderStatus.PROCESSING | OrderStatus.FOOD_READY:
+            case OrderStatus.QUEUED | OrderStatus.PROCESSING:
                 return RegistrationResult(RegistrationAction.IGNORE, current)
+
+            case OrderStatus.FOOD_READY:
+                return RegistrationResult(RegistrationAction.DEFER_REPUBLISH, current)
 
             case OrderStatus.PUBLISHED:
                 ready = transition(current, RepublishRequested())

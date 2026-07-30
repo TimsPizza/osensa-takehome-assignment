@@ -31,6 +31,7 @@ from app.order_state import (
     ProcessingStarted,
     PublishConfirmed,
     QueueAdmissionFailed,
+    RepublishRequested,
 )
 from app.protocol import (
     KITCHEN_PRESSURE_TOPIC,
@@ -93,6 +94,8 @@ class MqttOrderService:
             maxsize=(worker_count + queue_capacity) * 4,
         )
         self._pending_update: OrderStatusUpdate | None = None
+        # Coalesce exact retries received while their cached result is in flight.
+        self._deferred_republishes: set[OrderKey] = set()
         self._service_instance_id = uuid4()
         self._table_projection = TableSnapshotProjection(
             service_instance_id=self._service_instance_id,
@@ -290,6 +293,15 @@ class MqttOrderService:
         if registration.action is RegistrationAction.IGNORE:
             LOGGER.info(
                 "order_duplicate_ignored order_id=%s status=%s",
+                order.order_id,
+                registration.state.status,
+            )
+            return
+
+        if registration.action is RegistrationAction.DEFER_REPUBLISH:
+            self._deferred_republishes.add((order.table_id, order.order_id))
+            LOGGER.info(
+                "order_republish_deferred order_id=%s status=%s",
                 order.order_id,
                 registration.state.status,
             )
@@ -497,6 +509,27 @@ class MqttOrderService:
                     PublishConfirmed(),
                 )
                 internal_status = published_order.status
+                order_key = (update.table_id, update.order_id)
+                # Keep confirmation, intent lookup, and replay scheduling free of
+                # awaits so a retry must land entirely before or after this block.
+                if order_key in self._deferred_republishes:
+                    ready_order = self._registry.apply(
+                        update.table_id,
+                        update.order_id,
+                        RepublishRequested(),
+                    )
+                    if ready_order.food is None:
+                        raise RuntimeError(
+                            f"deferred republished order has no food: {update.order_id}"
+                        )
+                    self._queue_status_update(ready_order.food)
+                    self._deferred_republishes.remove(order_key)
+                    internal_status = ready_order.status
+                    LOGGER.info(
+                        "order_deferred_republish_scheduled order_id=%s status=%s",
+                        update.order_id,
+                        ready_order.status,
+                    )
 
             LOGGER.info(
                 "order_status_published order_id=%s table_id=%d topic=%s "
