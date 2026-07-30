@@ -3,255 +3,38 @@
 	import RadioIcon from '@lucide/svelte/icons/radio';
 	import UtensilsIcon from '@lucide/svelte/icons/utensils';
 	import { onMount } from 'svelte';
-	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 	import { BoundaryTestController } from '$lib/boundary-test-controller';
 	import AppSidebar, { type AppPanel } from '$lib/components/app-sidebar.svelte';
 	import BoundaryLab from '$lib/components/boundary-lab.svelte';
 	import BrokerSettingsDialog from '$lib/components/broker-settings-dialog.svelte';
 	import KitchenPressure from '$lib/components/kitchen-pressure.svelte';
-	import TableCard from '$lib/components/table-card.svelte';
+	import RestaurantPanel from '$lib/components/restaurant-panel.svelte';
 	import { Badge } from '$lib/components/ui/badge';
-	import { Button } from '$lib/components/ui/button';
-	import * as Dialog from '$lib/components/ui/dialog';
-	import { Input } from '$lib/components/ui/input';
-	import { Label } from '$lib/components/ui/label';
-	import { OrderRequestedSchema, type KitchenPressureSnapshot } from '$lib/generated/contracts';
-	import {
-		clearSessionMqttCredentials,
-		clearStoredMqttUrl,
-		readSessionMqttCredentials,
-		readStoredMqttUrl,
-		RestaurantMqttClient,
-		resolveMqttUrl,
-		storeSessionMqttCredentials,
-		storeMqttUrl,
-		type BrokerConnectionSettings,
-		type BrokerCredentials,
-		type ConnectionState,
-		type MqttClientCallbacks
-	} from '$lib/mqtt-client';
-	import {
-		addSendingOrder,
-		applyOrderStatus,
-		markSendFailed,
-		replaceTableFromSnapshot,
-		shouldApplyTableSnapshot,
-		type OrderView,
-		type TableSnapshotCursor,
-		type TableId
-	} from '$lib/order-state';
-	import { createRandomOrders } from '$lib/random-orders';
+	import { RestaurantSession } from '$lib/restaurant-session.svelte';
 
-	const tables = [1, 2, 3, 4] as const;
+	const session = new RestaurantSession({
+		onOrderStatus: (status) => boundaryTests.handleOrderStatus(status),
+		onKitchenPressure: (snapshot) => boundaryTests.handlePressure(snapshot)
+	});
+	const boundaryTests = new BoundaryTestController((order) => session.publishOrder(order));
 
-	let orders = $state<OrderView[]>([]);
-	let kitchenPressure = $state<KitchenPressureSnapshot>();
-	let connectionState = $state<ConnectionState>('connecting');
-	let connectionError = $state('');
-	let orderDialogOpen = $state(false);
-	let activeTable = $state<TableId | undefined>();
-	let foodName = $state('');
-	let formError = $state('');
-	let submitting = $state(false);
 	let activePanel = $state<AppPanel>('restaurant');
 	let brokerSettingsOpen = $state(false);
-	let activeBrokerUrl = $state('');
-	let activeBrokerCredentials = $state<BrokerCredentials>();
-	let defaultBrokerUrl = $state('');
-	let pageProtocol = $state('');
-	const bulkOrderingTables = new SvelteSet<TableId>();
-	const snapshotCursors = new SvelteMap<TableId, TableSnapshotCursor>();
-	let mqttClient: RestaurantMqttClient | undefined;
-	const boundaryTests = new BoundaryTestController(async (order) => {
-		if (!mqttClient || connectionState !== 'connected') {
-			throw new Error('MQTT client is not ready');
-		}
-		await mqttClient.publishOrder(order);
-	});
-	let connectionGeneration = 0;
-
-	const connected = $derived(connectionState === 'connected');
-	const connectionCopy = $derived.by(() => {
-		switch (connectionState) {
-			case 'connected':
-				return 'Kitchen online';
-			case 'connecting':
-				return 'Connecting';
-			case 'reconnecting':
-				return 'Reconnecting';
-			case 'offline':
-				return 'Kitchen offline';
-		}
-	});
-
-	function createMqttClient(url: string, credentials?: BrokerCredentials): RestaurantMqttClient {
-		const callbacks: MqttClientCallbacks = {
-			onConnectionChange: (state) => {
-				connectionState = state;
-				if (state === 'connected') {
-					connectionError = '';
-				}
-			},
-			onOrderStatus: (status) => {
-				orders = applyOrderStatus(orders, status);
-				boundaryTests.handleOrderStatus(status);
-			},
-			onTableSnapshot: (snapshot) => {
-				const tableId = snapshot.tableId as TableId;
-				if (!shouldApplyTableSnapshot(snapshot, snapshotCursors.get(tableId))) {
-					return;
-				}
-				orders = replaceTableFromSnapshot(orders, snapshot);
-				snapshotCursors.set(tableId, {
-					serviceInstanceId: snapshot.serviceInstanceId,
-					revision: snapshot.revision
-				});
-			},
-			onKitchenPressure: (snapshot) => {
-				if (
-					!kitchenPressure ||
-					kitchenPressure.serviceInstanceId !== snapshot.serviceInstanceId ||
-					snapshot.revision > kitchenPressure.revision
-				) {
-					kitchenPressure = snapshot;
-					boundaryTests.handlePressure(snapshot);
-				}
-			},
-			onError: (message) => {
-				connectionError = message;
-			}
-		};
-		return new RestaurantMqttClient(url, callbacks, credentials);
-	}
-
-	async function reconnectToBroker(settings: BrokerConnectionSettings): Promise<void> {
-		const generation = ++connectionGeneration;
-		const previousClient = mqttClient;
-		mqttClient = undefined;
-		connectionState = 'connecting';
-		connectionError = '';
-		kitchenPressure = undefined;
-
-		await previousClient?.disconnect();
-		if (generation !== connectionGeneration) {
-			return;
-		}
-
-		activeBrokerUrl = settings.url;
-		activeBrokerCredentials = settings.credentials;
-		const nextClient = createMqttClient(settings.url, settings.credentials);
-		mqttClient = nextClient;
-		nextClient.connect();
-	}
-
-	async function saveBrokerSettings(settings: BrokerConnectionSettings): Promise<void> {
-		const storedUrl = storeMqttUrl(window.localStorage, settings.url, pageProtocol);
-		storeSessionMqttCredentials(window.sessionStorage, settings.credentials);
-		await reconnectToBroker({
-			url: storedUrl,
-			credentials: settings.credentials
-		});
-	}
-
-	async function resetBrokerUrl(): Promise<void> {
-		clearStoredMqttUrl(window.localStorage);
-		clearSessionMqttCredentials(window.sessionStorage);
-		await reconnectToBroker({ url: defaultBrokerUrl });
-	}
 
 	onMount(() => {
-		pageProtocol = window.location.protocol;
-		defaultBrokerUrl = resolveMqttUrl(window.location, import.meta.env.VITE_MQTT_URL);
-		activeBrokerUrl =
-			readStoredMqttUrl(window.localStorage, window.location.protocol) ?? defaultBrokerUrl;
-		activeBrokerCredentials = readSessionMqttCredentials(window.sessionStorage);
-		mqttClient = createMqttClient(activeBrokerUrl, activeBrokerCredentials);
-		mqttClient.connect();
-
-		return () => {
-			connectionGeneration += 1;
-			boundaryTests.destroy();
-			void mqttClient?.disconnect();
-		};
-	});
-
-	function ordersForTable(tableId: TableId): OrderView[] {
-		return orders.filter((order) => order.tableId === tableId);
-	}
-
-	function openOrderDialog(tableId: TableId, requestedFood = ''): void {
-		activeTable = tableId;
-		foodName = requestedFood;
-		formError = '';
-		orderDialogOpen = true;
-	}
-
-	async function submitOrder(event: SubmitEvent): Promise<void> {
-		event.preventDefault();
-		if (!activeTable || !mqttClient || submitting) {
-			return;
-		}
-
-		const order = OrderRequestedSchema.safeParse({
-			schemaVersion: 1,
-			orderId: crypto.randomUUID(),
-			tableId: activeTable,
-			foodName: foodName.trim()
-		});
-		if (!order.success) {
-			formError = 'Enter a food name between 1 and 100 characters.';
-			return;
-		}
-
-		submitting = true;
-		formError = '';
-		orders = addSendingOrder(orders, {
-			...order.data,
-			tableId: activeTable
-		});
-
-		try {
-			await mqttClient.publishOrder(order.data);
-			orderDialogOpen = false;
-			foodName = '';
-		} catch {
-			const message = 'The order could not be sent. Check the kitchen connection and retry.';
-			orders = markSendFailed(orders, order.data.orderId, message);
-			formError = message;
-		} finally {
-			submitting = false;
-		}
-	}
-
-	async function placeRandomOrders(tableId: TableId): Promise<void> {
-		if (!connected || !mqttClient || bulkOrderingTables.has(tableId)) {
-			return;
-		}
-
-		const client = mqttClient;
-		bulkOrderingTables.add(tableId);
-		const batch = createRandomOrders(tableId);
-		orders = batch.reduceRight(
-			(currentOrders, order) => addSendingOrder(currentOrders, order),
-			orders
+		session.start(
+			window.location,
+			window.localStorage,
+			window.sessionStorage,
+			import.meta.env.VITE_MQTT_URL
 		);
 
-		try {
-			const results = await Promise.allSettled(batch.map((order) => client.publishOrder(order)));
-			for (const [index, result] of results.entries()) {
-				if (result.status === 'rejected') {
-					orders = markSendFailed(
-						orders,
-						batch[index].orderId,
-						'The order could not be sent. Check the kitchen connection and retry.'
-					);
-				}
-			}
-		} finally {
-			bulkOrderingTables.delete(tableId);
-		}
-	}
+		return () => {
+			boundaryTests.destroy();
+			void session.destroy();
+		};
+	});
 </script>
 
 <svelte:head>
@@ -265,7 +48,7 @@
 <div class="min-h-screen bg-[linear-gradient(180deg,#fafaf9_0%,#f5f5f4_55%,#ede9e3_100%)]">
 	<AppSidebar
 		{activePanel}
-		{connectionState}
+		connectionState={session.connectionState}
 		onNavigate={(panel) => (activePanel = panel)}
 		onConfigureBroker={() => (brokerSettingsOpen = true)}
 	/>
@@ -291,47 +74,36 @@
 				</div>
 
 				<Badge
-					variant={connected ? 'outline' : 'secondary'}
-					class={connected
+					variant={session.connected ? 'outline' : 'secondary'}
+					class={session.connected
 						? 'border-emerald-200 bg-emerald-50 px-3 py-2 text-emerald-800'
 						: 'px-3 py-2 text-stone-600'}
 				>
 					<span
-						class={`size-2 rounded-full ${connected ? 'bg-emerald-500' : 'animate-pulse bg-amber-500'}`}
+						class={`size-2 rounded-full ${session.connected ? 'bg-emerald-500' : 'animate-pulse bg-amber-500'}`}
 					></span>
-					{connectionCopy}
+					{session.connectionCopy}
 				</Badge>
 			</header>
 
-			{#if connectionError}
+			{#if session.connectionError}
 				<div
 					class="mb-6 flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800"
 					role="status"
 				>
 					<CircleAlertIcon class="mt-0.5 size-4 shrink-0" />
 					<div>
-						<p class="font-medium">{connectionError}</p>
+						<p class="font-medium">{session.connectionError}</p>
 						<p class="mt-0.5 text-red-700">Orders are paused while we reconnect automatically.</p>
 					</div>
 				</div>
 			{/if}
 
 			{#if activePanel === 'restaurant'}
-				<section class="grid gap-5 md:grid-cols-2 xl:grid-cols-4" aria-label="Restaurant tables">
-					{#each tables as tableId (tableId)}
-						<TableCard
-							{tableId}
-							orders={ordersForTable(tableId)}
-							{connected}
-							bulkOrdering={bulkOrderingTables.has(tableId)}
-							onOrder={openOrderDialog}
-							onBulkOrder={placeRandomOrders}
-						/>
-					{/each}
-				</section>
+				<RestaurantPanel {session} />
 			{:else}
 				<section aria-label="System boundary tests">
-					<BoundaryLab controller={boundaryTests} {connected} />
+					<BoundaryLab controller={boundaryTests} connected={session.connected} />
 				</section>
 			{/if}
 
@@ -344,59 +116,15 @@
 		</div>
 	</main>
 
-	<KitchenPressure snapshot={kitchenPressure} {connected} />
+	<KitchenPressure snapshot={session.kitchenPressure} connected={session.connected} />
 </div>
-
-<Dialog.Root bind:open={orderDialogOpen}>
-	<Dialog.Content>
-		<Dialog.Header>
-			<Dialog.Title>Order for table {activeTable}</Dialog.Title>
-			<Dialog.Description>
-				Tell the kitchen what you would like. You can place more than one order per table.
-			</Dialog.Description>
-		</Dialog.Header>
-
-		<form class="space-y-5" onsubmit={submitOrder}>
-			<div class="space-y-2">
-				<Label for="food-name">Food name</Label>
-				<Input
-					id="food-name"
-					name="foodName"
-					placeholder="e.g. Margherita pizza"
-					maxlength={100}
-					autocomplete="off"
-					aria-invalid={formError ? 'true' : undefined}
-					aria-describedby={formError ? 'food-name-error' : undefined}
-					bind:value={foodName}
-				/>
-				{#if formError}
-					<p id="food-name-error" class="text-sm text-red-700">{formError}</p>
-				{/if}
-			</div>
-
-			<Dialog.Footer>
-				<Button
-					type="button"
-					variant="outline"
-					onclick={() => (orderDialogOpen = false)}
-					disabled={submitting}
-				>
-					Cancel
-				</Button>
-				<Button type="submit" disabled={!connected || submitting}>
-					{submitting ? 'Sending…' : 'Send order'}
-				</Button>
-			</Dialog.Footer>
-		</form>
-	</Dialog.Content>
-</Dialog.Root>
 
 <BrokerSettingsDialog
 	bind:open={brokerSettingsOpen}
-	activeUrl={activeBrokerUrl}
-	activeCredentials={activeBrokerCredentials}
-	defaultUrl={defaultBrokerUrl}
-	{pageProtocol}
-	onSave={saveBrokerSettings}
-	onReset={resetBrokerUrl}
+	activeUrl={session.activeBrokerUrl}
+	activeCredentials={session.activeBrokerCredentials}
+	defaultUrl={session.defaultBrokerUrl}
+	pageProtocol={session.pageProtocol}
+	onSave={(settings) => session.saveBrokerSettings(settings)}
+	onReset={() => session.resetBrokerSettings()}
 />
